@@ -1,0 +1,24 @@
+id: qa-storage-model
+task_type: qa
+description: >
+  How does YAMS store documents? Explain the content-addressable storage
+  model, how documents are indexed, and how metadata is tracked.
+ground_truth:
+  patterns:
+    - re:content.addressable|CAS|hash
+    - re:SQLite|database
+    - re:metadata
+    - re:index
+evaluation:
+  contains_patterns:
+    - re:content.addressable|CAS|hash|SHA
+    - re:index|store|document
+  pass_metric: contains_pattern
+  pass_threshold: 0.8
+  length:
+    min_tokens: 30
+    max_tokens: 600
+tags:
+  - storage
+  - architecture
+  - concepts

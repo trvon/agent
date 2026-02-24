@@ -1,0 +1,26 @@
+id: coding-resource-governor
+task_type: coding
+description: >
+  How does the ResourceGovernor in the YAMS daemon work? What admission
+  control methods does it provide, and how does it coordinate resource
+  pressure across components?
+ground_truth:
+  patterns:
+    - ResourceGovernor
+    - re:canAdmitWork|canScaleUp|canLoadModel|admission
+    - re:memory|pressure
+    - re:daemon
+evaluation:
+  contains_patterns:
+    - ResourceGovernor
+    - re:admission|canAdmit|pressure
+    - re:memory|resource
+  pass_metric: contains_pattern
+  pass_threshold: 0.8
+  length:
+    min_tokens: 40
+    max_tokens: 800
+tags:
+  - daemon
+  - resource-management
+  - architecture

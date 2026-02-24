@@ -1,0 +1,71 @@
+# Model configurations for DCS experiments
+# Primary: LM Studio (OpenAI-compatible API at localhost:1234)
+# Secondary: Ollama (OpenAI-compatible API at localhost:11434) for OSS release
+
+backends:
+  lmstudio:
+    base_url: "http://localhost:1234/v1"
+    api_key: "lm-studio"
+
+  ollama:
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+
+# Models available for experiments (update based on what's loaded)
+models:
+  # --- Small models (primary scaffolding targets) ---
+  nemotron-nano:
+    backend: lmstudio
+    name: "nvidia/nemotron-3-nano"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: executor
+
+  qwen3-4b:
+    backend: lmstudio
+    name: "qwen/qwen3-4b-thinking-2507"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: executor
+
+  # --- Mid-tier models (comparison + critic) ---
+  qwen3-30b-a3b:
+    backend: lmstudio
+    name: "qwen/qwen3-30b-a3b-2507"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: critic
+
+  devstral:
+    backend: lmstudio
+    name: "mistralai/devstral-small-2-2512"
+    context_window: 32768
+    max_output_tokens: 4096
+    temperature: 0.7
+    role: critic
+
+  gemma-27b:
+    backend: lmstudio
+    name: "google/gemma-3-27b"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: critic
+
+  # --- Large models (ceiling reference) ---
+  gpt-oss-120b:
+    backend: lmstudio
+    name: "openai/gpt-oss-120b"
+    context_window: 32768
+    max_output_tokens: 4096
+    temperature: 0.7
+    role: baseline
+
+# Default experiment configuration
+defaults:
+  executor: qwen3-4b
+  critic: devstral
+  baseline: gpt-oss-120b

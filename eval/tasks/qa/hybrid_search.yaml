@@ -1,0 +1,27 @@
+id: qa-hybrid-search
+task_type: qa
+description: >
+  What is hybrid search in YAMS and how does it work? Explain the
+  different search backends that are fused together and why this
+  approach is used instead of pure semantic or keyword search.
+ground_truth:
+  patterns:
+    - re:hybrid
+    - re:FTS5|full.text|keyword
+    - re:semantic|vector|embedding
+    - re:knowledge.graph|KG|graph
+    - re:fus(ion|e)|combin
+evaluation:
+  contains_patterns:
+    - re:semantic|vector
+    - re:keyword|FTS|full.text
+    - re:hybrid|fus(ion|e)
+  pass_metric: contains_pattern
+  pass_threshold: 0.8
+  length:
+    min_tokens: 50
+    max_tokens: 600
+tags:
+  - search
+  - architecture
+  - concepts

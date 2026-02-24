@@ -1,0 +1,40 @@
+# YAMS search fusion weights for context retrieval
+# These are starting points — the optimizer adjusts them based on feedback
+
+search:
+  # Weight allocation across retrieval strategies
+  fusion_weights:
+    lexical: 0.3       # FTS5 keyword match
+    semantic: 0.4      # Dense vector similarity
+    graph: 0.2         # Knowledge graph traversal
+    metadata: 0.1      # Tag/metadata match
+
+  # Per-query-type defaults
+  query_type_weights:
+    semantic:
+      lexical: 0.2
+      semantic: 0.6
+      graph: 0.15
+      metadata: 0.05
+    grep:
+      lexical: 0.8
+      semantic: 0.1
+      graph: 0.05
+      metadata: 0.05
+    graph:
+      lexical: 0.1
+      semantic: 0.2
+      graph: 0.6
+      metadata: 0.1
+    get:
+      lexical: 0.0
+      semantic: 0.0
+      graph: 0.0
+      metadata: 1.0
+
+  # Assembler scoring parameters
+  assembler:
+    novelty_decay: 0.85        # Exponential decay for similar chunks
+    structural_bonus: 1.2      # Bonus for complete code blocks
+    min_score_threshold: 0.1   # Minimum score to consider a chunk
+    max_chunk_tokens: 512      # Maximum tokens per chunk before splitting

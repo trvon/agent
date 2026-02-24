@@ -1,0 +1,26 @@
+id: qa-knowledge-graph
+task_type: qa
+description: >
+  How does the YAMS knowledge graph work? What kind of data does it
+  store, how are relationships represented, and how is it used
+  during search?
+ground_truth:
+  patterns:
+    - re:knowledge.graph|KG
+    - re:node|edge|relation
+    - re:graph
+    - re:search|query|travers
+evaluation:
+  contains_patterns:
+    - re:knowledge.graph|KG|graph
+    - re:node|edge|relation
+    - re:search|travers|query
+  pass_metric: contains_pattern
+  pass_threshold: 0.8
+  length:
+    min_tokens: 40
+    max_tokens: 600
+tags:
+  - knowledge-graph
+  - architecture
+  - concepts

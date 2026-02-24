@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "yams-agent"
+version = "0.0.1"
+description = "Dynamic Context Scaffold — YAMS-backed retrieval harness for small LLM agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "GPL-3.0-only"}
+authors = [{name = "YAMS Project"}]
+keywords = [
+  "yams",
+  "agent",
+  "llm",
+  "scaffolding",
+  "dynamic-context",
+  "retrieval",
+  "rlm",
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "openai>=1.50",
+  "tiktoken>=0.8",
+  "pyyaml>=6.0",
+  "rich>=13.0",
+]
+
+[project.scripts]
+dcs = "dcs.cli:main"
+
+[dependency-groups]
+dev = [
+  "ruff>=0.6",
+  "pytest>=8.2",
+  "pytest-asyncio>=0.24",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+fix = true
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["dcs"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

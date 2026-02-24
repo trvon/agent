@@ -1,0 +1,72 @@
+# Baseline comparison configurations for DCS experiments
+
+experiments:
+  # Core comparison: scaffolded small vs vanilla small
+  scaffold_vs_vanilla:
+    description: "Does YAMS scaffolding help small models?"
+    runs:
+      - name: "vanilla-4b"
+        model: qwen3-4b
+        scaffolded: false
+        max_iterations: 1
+      - name: "scaffolded-4b"
+        model: qwen3-4b
+        scaffolded: true
+        max_iterations: 3
+      - name: "vanilla-nano"
+        model: nemotron-nano
+        scaffolded: false
+        max_iterations: 1
+      - name: "scaffolded-nano"
+        model: nemotron-nano
+        scaffolded: true
+        max_iterations: 3
+
+  # Scale comparison: does scaffold reduce model size gap?
+  scaffold_vs_scale:
+    description: "Can scaffolded small match unscaffolded large?"
+    runs:
+      - name: "scaffolded-4b"
+        model: qwen3-4b
+        scaffolded: true
+        max_iterations: 3
+      - name: "vanilla-27b"
+        model: gemma-27b
+        scaffolded: false
+        max_iterations: 1
+      - name: "ceiling-120b"
+        model: gpt-oss-120b
+        scaffolded: false
+        max_iterations: 1
+
+  # Iteration study: does self-critique improve retrieval?
+  iteration_convergence:
+    description: "Does self-critique improve context quality over iterations?"
+    runs:
+      - name: "scaffolded-4b-1iter"
+        model: qwen3-4b
+        scaffolded: true
+        max_iterations: 1
+      - name: "scaffolded-4b-3iter"
+        model: qwen3-4b
+        scaffolded: true
+        max_iterations: 3
+      - name: "scaffolded-4b-5iter"
+        model: qwen3-4b
+        scaffolded: true
+        max_iterations: 5
+
+  # Critic study: does a better critic help?
+  critic_quality:
+    description: "Does using a larger critic model improve retrieval?"
+    runs:
+      - name: "self-critique-4b"
+        model: qwen3-4b
+        critic: qwen3-4b
+        scaffolded: true
+        max_iterations: 3
+      - name: "devstral-critique"
+        model: qwen3-4b
+        critic: devstral
+        scaffolded: true
+        max_iterations: 3

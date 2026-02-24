@@ -1,0 +1,26 @@
+id: qa-mcp-protocol
+task_type: qa
+description: >
+  How does YAMS expose its functionality over MCP (Model Context Protocol)?
+  How is the server started, what transport does it use, and how does
+  a client communicate with it?
+ground_truth:
+  patterns:
+    - re:MCP|Model Context Protocol
+    - re:stdio|NDJSON|JSON.RPC
+    - re:yams serve
+    - re:tool
+evaluation:
+  contains_patterns:
+    - re:MCP|Model Context Protocol
+    - re:stdio|JSON.RPC|NDJSON
+    - re:tool|serve
+  pass_metric: contains_pattern
+  pass_threshold: 0.8
+  length:
+    min_tokens: 30
+    max_tokens: 600
+tags:
+  - mcp
+  - protocol
+  - concepts

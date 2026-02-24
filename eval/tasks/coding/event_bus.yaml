@@ -1,0 +1,23 @@
+id: coding-event-bus
+task_type: coding
+description: >
+  Describe the InternalEventBus used in the YAMS daemon. How are
+  typed channels keyed, and how do components subscribe and publish events?
+ground_truth:
+  patterns:
+    - InternalEventBus
+    - re:channel|typed
+    - re:subscribe|publish|emit
+evaluation:
+  contains_patterns:
+    - InternalEventBus
+    - re:channel|subscribe|publish
+  pass_metric: contains_pattern
+  pass_threshold: 0.8
+  length:
+    min_tokens: 30
+    max_tokens: 800
+tags:
+  - daemon
+  - event-bus
+  - coordination

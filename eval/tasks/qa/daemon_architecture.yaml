@@ -1,0 +1,27 @@
+id: qa-daemon-architecture
+task_type: qa
+description: >
+  Describe the YAMS daemon architecture. What major components does
+  it have, how do they coordinate, and what role does the event bus
+  play in the system?
+ground_truth:
+  patterns:
+    - re:daemon
+    - re:InternalEventBus|event.bus
+    - re:ResourceGovernor|resource
+    - re:EmbeddingService|embedding
+    - re:component
+evaluation:
+  contains_patterns:
+    - re:daemon
+    - re:event.bus|InternalEventBus|component
+    - re:embed|resource|state
+  pass_metric: contains_pattern
+  pass_threshold: 0.8
+  length:
+    min_tokens: 50
+    max_tokens: 800
+tags:
+  - daemon
+  - architecture
+  - concepts

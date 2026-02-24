@@ -1,0 +1,25 @@
+id: coding-embedding-service
+task_type: coding
+description: >
+  How does the YAMS EmbeddingService work? What model does it use
+  by default, how are embeddings stored, and how does batch processing work?
+ground_truth:
+  patterns:
+    - EmbeddingService
+    - re:MiniLM|all-MiniLM-L6-v2
+    - re:384|dimension
+    - re:batch|queue
+evaluation:
+  contains_patterns:
+    - EmbeddingService
+    - re:MiniLM|all-MiniLM
+    - re:batch|queue|embed
+  pass_metric: contains_pattern
+  pass_threshold: 0.8
+  length:
+    min_tokens: 30
+    max_tokens: 800
+tags:
+  - embedding
+  - daemon
+  - vector

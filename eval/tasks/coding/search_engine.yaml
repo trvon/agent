@@ -1,0 +1,27 @@
+id: coding-search-engine
+task_type: coding
+description: >
+  Explain the SearchEngine class in YAMS. What is the class declaration,
+  what search types does it support, and how does hybrid search combine
+  results from different backends?
+ground_truth:
+  patterns:
+    - SearchEngine
+    - re:hybrid|fusion
+    - re:FTS5|full.text
+    - re:semantic|vector|embedding
+    - re:knowledge.graph|KG
+evaluation:
+  contains_patterns:
+    - SearchEngine
+    - re:hybrid|fusion
+    - re:semantic|vector|embedding
+  pass_metric: contains_pattern
+  pass_threshold: 0.8
+  length:
+    min_tokens: 50
+    max_tokens: 1000
+tags:
+  - search
+  - hybrid
+  - architecture
