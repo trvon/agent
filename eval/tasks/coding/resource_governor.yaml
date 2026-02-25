@@ -5,6 +5,14 @@ description: >
   control methods does it provide, and how does it coordinate resource
   pressure across components?
 ground_truth:
+  files:
+    - include/yams/daemon/components/ResourceGovernor.h
+    - src/daemon/components/ServiceManager.cpp
+  symbols:
+    - ResourceGovernor
+    - canAdmitWork
+    - canScaleUp
+    - canLoadModel
   patterns:
     - ResourceGovernor
     - re:canAdmitWork|canScaleUp|canLoadModel|admission

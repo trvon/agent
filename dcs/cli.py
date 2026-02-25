@@ -43,12 +43,18 @@ def _load_models(config_dir: Path) -> tuple[ModelConfig, ModelConfig | None]:
             context_window=int(entry.get("context_window") or 4096),
             max_output_tokens=int(entry.get("max_output_tokens") or 1024),
             temperature=float(entry.get("temperature") or 0.7),
+            system_suffix=str(entry.get("system_suffix") or ""),
+            request_timeout_s=float(entry.get("request_timeout_s") or 120.0),
+            max_retries=int(entry.get("max_retries") or 2),
+            retry_backoff_s=float(entry.get("retry_backoff_s") or 2.0),
         )
 
     executor_key = str(defaults.get("executor") or "")
     critic_key = str(defaults.get("critic") or "")
 
-    executor = build(executor_key) if executor_key else ModelConfig(name="qwen/qwen3-4b-thinking-2507")
+    executor = (
+        build(executor_key) if executor_key else ModelConfig(name="qwen/qwen3-4b-thinking-2507")
+    )
     critic = build(critic_key) if critic_key else None
     return executor, critic
 
@@ -75,6 +81,19 @@ def load_pipeline_config(config_dir: Path) -> PipelineConfig:
     return PipelineConfig(executor_model=executor, critic_model=critic, search_weights=weights)
 
 
+def _apply_runtime_overrides(args: argparse.Namespace, cfg: PipelineConfig) -> PipelineConfig:
+    ngt = getattr(args, "ground_truth_mode", None)
+    if ngt is not None:
+        cfg.no_ground_truth_mode = bool(ngt)
+    dspy_flag = getattr(args, "dspy_faithfulness", None)
+    if dspy_flag is not None:
+        cfg.use_dspy_faithfulness = bool(dspy_flag)
+    profile = getattr(args, "context_profile", None)
+    if profile:
+        cfg.context_profile = str(profile)
+    return cfg
+
+
 def _init_yams_client(cfg: PipelineConfig):
     from dcs.client import YAMSClient
 
@@ -84,12 +103,12 @@ def _init_yams_client(cfg: PipelineConfig):
         c = YAMSClient()  # type: ignore[call-arg]
         if hasattr(c, "yams_binary"):
             try:
-                setattr(c, "yams_binary", cfg.yams_binary)
+                c.yams_binary = cfg.yams_binary
             except Exception:
                 pass
         if hasattr(c, "yams_data_dir"):
             try:
-                setattr(c, "yams_data_dir", cfg.yams_data_dir)
+                c.yams_data_dir = cfg.yams_data_dir
             except Exception:
                 pass
         return c
@@ -179,13 +198,67 @@ def _build_parser(default_task_dir: Path) -> argparse.ArgumentParser:
 
     runp = sub.add_parser("run", help="run a single task")
     runp.add_argument("task", type=str, help="task description")
+    runp.add_argument(
+        "--ground-truth-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable ground-truth-free faithfulness policy",
+    )
+    runp.add_argument(
+        "--dspy-faithfulness",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable DSPy-first structured faithfulness extraction",
+    )
+    runp.add_argument(
+        "--context-profile",
+        choices=["auto", "standard", "large"],
+        default=None,
+        help="Context budget profile",
+    )
 
     evalp = sub.add_parser("eval", help="run evaluation suite")
     evalp.add_argument("--task-dir", type=str, default=str(default_task_dir))
     evalp.add_argument("--type", type=str, choices=[t.value for t in TaskType], default=None)
+    evalp.add_argument(
+        "--ground-truth-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable ground-truth-free faithfulness policy",
+    )
+    evalp.add_argument(
+        "--dspy-faithfulness",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable DSPy-first structured faithfulness extraction",
+    )
+    evalp.add_argument(
+        "--context-profile",
+        choices=["auto", "standard", "large"],
+        default=None,
+        help="Context budget profile",
+    )
 
     compp = sub.add_parser("compare", help="compare scaffolded vs vanilla")
     compp.add_argument("--task-dir", type=str, default=str(default_task_dir))
+    compp.add_argument(
+        "--ground-truth-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable ground-truth-free faithfulness policy",
+    )
+    compp.add_argument(
+        "--dspy-faithfulness",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable DSPy-first structured faithfulness extraction",
+    )
+    compp.add_argument(
+        "--context-profile",
+        choices=["auto", "standard", "large"],
+        default=None,
+        help="Context budget profile",
+    )
 
     sub.add_parser("status", help="check YAMS + model connectivity")
     return p
@@ -200,7 +273,7 @@ def main() -> None:
     parser = _build_parser(default_task_dir)
     args = parser.parse_args()
 
-    cfg = load_pipeline_config(config_dir)
+    cfg = _apply_runtime_overrides(args, load_pipeline_config(config_dir))
 
     async def run_cmd() -> int:
         if args.cmd == "run":

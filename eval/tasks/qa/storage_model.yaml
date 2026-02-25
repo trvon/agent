@@ -4,6 +4,15 @@ description: >
   How does YAMS store documents? Explain the content-addressable storage
   model, how documents are indexed, and how metadata is tracked.
 ground_truth:
+  files:
+    - include/yams/api/content_store.h
+    - src/api/content_store_impl.cpp
+    - src/metadata/metadata_repository.cpp
+  symbols:
+    - content-addressable
+    - sha256
+    - MetadataRepository
+    - index
   patterns:
     - re:content.addressable|CAS|hash
     - re:SQLite|database

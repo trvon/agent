@@ -13,7 +13,12 @@ import time
 from typing import Any
 
 try:
-    from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, BadRequestError  # type: ignore[import-not-found]
+    from openai import (  # type: ignore[import-not-found]
+        APIConnectionError,
+        APITimeoutError,
+        AsyncOpenAI,
+        BadRequestError,
+    )
 except Exception:  # pragma: no cover
     # Allow importing this module in environments without the OpenAI SDK.
     APIConnectionError = Exception  # type: ignore[assignment]

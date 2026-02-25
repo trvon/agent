@@ -4,6 +4,15 @@ description: >
   How does the YAMS EmbeddingService work? What model does it use
   by default, how are embeddings stored, and how does batch processing work?
 ground_truth:
+  files:
+    - src/vector/embedding_service.cpp
+    - include/yams/vector/embedding_service.h
+    - include/yams/vector/dim_resolver.h
+  symbols:
+    - EmbeddingService
+    - generateEmbeddingsInternal
+    - all-MiniLM-L6-v2
+    - vectors.db
   patterns:
     - EmbeddingService
     - re:MiniLM|all-MiniLM-L6-v2

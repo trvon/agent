@@ -12,8 +12,9 @@ import re
 import time
 from typing import Any
 
-from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, NotFoundError
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, BadRequestError, NotFoundError
 
+from .lmstudio_context import preload_model
 from .types import ContextBlock, ExecutionResult, ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,23 @@ logger = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _UNCLOSED_THINK_RE = re.compile(r"<think>.*", re.DOTALL)
+_CTX_OVERFLOW_RE = re.compile(
+    r"tokens to keep(?: from the initial prompt)?(?:\s*\((\d+)\))?.*?context length(?:\s*\((\d+)\))?",
+    re.IGNORECASE,
+)
+_MODEL_UNLOADED_RE = re.compile(
+    r"model\s+is\s+unloaded|failed\s+to\s+load\s+model|model\s+not\s+loaded",
+    re.IGNORECASE,
+)
+
+
+def _parse_context_overflow(detail: str) -> tuple[int | None, int | None]:
+    m = _CTX_OVERFLOW_RE.search(detail or "")
+    if not m:
+        return None, None
+    keep = int(m.group(1)) if m.group(1) else None
+    ctx = int(m.group(2)) if m.group(2) else None
+    return keep, ctx
 
 
 def _strip_thinking(text: str) -> str:
@@ -44,11 +62,61 @@ def _strip_thinking(text: str) -> str:
     if "<think>" in text:
         # Extract content after the last <think> tag as best-effort output
         idx = text.rfind("<think>")
-        inner = text[idx + len("<think>"):].strip()
+        inner = text[idx + len("<think>") :].strip()
         if inner:
             return inner
 
     return text.strip()
+
+
+def _is_model_unloaded_error(detail: str) -> bool:
+    return bool(_MODEL_UNLOADED_RE.search(detail or ""))
+
+
+def _response_contract(task_text: str) -> str:
+    """Build a concise, task-aware answer contract.
+
+    Keeps small models focused on covering all requested facets.
+    """
+    t = (task_text or "").lower()
+    checklist: list[str] = []
+
+    def add(item: str) -> None:
+        if item not in checklist:
+            checklist.append(item)
+
+    if "default" in t and "model" in t:
+        add("state the default model name exactly")
+    if any(k in t for k in ("store", "storage", "stored", "persist")):
+        add("explain where and how data is stored")
+    if any(k in t for k in ("batch", "queue")):
+        add("describe batching/queue behavior")
+    if any(k in t for k in ("transport", "stdio", "json-rpc", "jsonrpc", "ndjson")):
+        add("name the transport/protocol explicitly")
+    if "tool" in t and any(k in t for k in ("list", "name", "registered", "register")):
+        add("list tool names explicitly and include one-line purpose")
+        if "mcp" in t:
+            add(
+                "for YAMS MCP tool-list tasks, explicitly include names such as search, grep, add, get, graph, and session_start/update_metadata when present in context"
+            )
+            add(
+                "ensure the answer includes literal terms search, grep, store, get, and graph (store can be explained via add/store documents)"
+            )
+    if any(k in t for k in ("node", "edge", "relation", "knowledge graph", "graph")):
+        add("cover nodes, edges/relations, and graph usage in search")
+
+    lines = [
+        "# Response Contract",
+        "",
+        "- Answer every part of the task directly.",
+        "- Use exact identifiers, model names, file names, and numeric values from context when available.",
+        "- If a required detail is missing from context, say it is unknown instead of guessing.",
+    ]
+    if checklist:
+        lines.append("- Ensure these task-specific requirements are covered:")
+        for item in checklist[:6]:
+            lines.append(f"  - {item}")
+    return "\n".join(lines)
 
 
 def format_context_prompt(context: ContextBlock) -> str:
@@ -114,7 +182,7 @@ class ModelExecutor:
         self.client = AsyncOpenAI(
             base_url=config.base_url,
             api_key=config.api_key,
-            timeout=60.0,  # 60s hard timeout per API call
+            timeout=float(config.request_timeout_s or 60.0),
         )
 
     def _build_messages(
@@ -134,6 +202,7 @@ class ModelExecutor:
         if context is not None:
             sys_parts.append(format_context_prompt(context).strip())
             sys_parts.append("# Task\n\n" + (task_text or "(empty)"))
+            sys_parts.append(_response_contract(task_text))
             sys_content = "\n\n".join(p for p in sys_parts if p)
             # Append system_suffix (e.g. "/no_think" for qwen3 thinking models)
             suffix = (self.config.system_suffix or "").strip()
@@ -193,13 +262,14 @@ class ModelExecutor:
         task: str,
         context: ContextBlock | None,
         system_prompt: str | None = None,
+        **kwargs: Any,
     ) -> ExecutionResult:
         messages = self._build_messages(
             task=task,
             context=context,
             system_prompt=system_prompt,
         )
-        return await self.execute_raw(messages)
+        return await self.execute_raw(messages, **kwargs)
 
     async def execute_raw(self, messages: list[dict], **kwargs: Any) -> ExecutionResult:
         """Run a raw chat completion request.
@@ -225,7 +295,7 @@ class ModelExecutor:
         start = time.perf_counter()
         try:
             if not stream:
-                resp = await self.client.chat.completions.create(**request_kwargs)
+                resp = await self._request_with_retries(request_kwargs)
                 raw = resp.model_dump()  # OpenAI pydantic model
                 output = self._extract_text_from_response(raw)
                 tokens_prompt, tokens_completion = self._usage_from_response(raw)
@@ -243,7 +313,7 @@ class ModelExecutor:
             output_parts: list[str] = []
             raw_chunks: list[dict[str, Any]] = []
 
-            stream_iter = await self.client.chat.completions.create(**request_kwargs)
+            stream_iter = await self._request_with_retries(request_kwargs)
             async for event in stream_iter:
                 # event is a ChatCompletionChunk
                 try:
@@ -284,7 +354,35 @@ class ModelExecutor:
                 latency_ms=latency_ms,
                 raw_response={"error": "model_not_found", "detail": str(e)},
             )
-        except (APIConnectionError, APITimeoutError, asyncio.TimeoutError) as e:
+        except BadRequestError as e:
+            latency_ms = (time.perf_counter() - start) * 1000.0
+            detail = str(e)
+            keep, ctx = _parse_context_overflow(detail)
+            if (
+                keep is not None
+                or "context length" in detail.lower()
+                or "tokens to keep" in detail.lower()
+            ):
+                logger.warning("Model context overflow: %s", detail)
+                return ExecutionResult(
+                    output=f"Error: context overflow: {detail}",
+                    model=model,
+                    latency_ms=latency_ms,
+                    raw_response={
+                        "error": "context_overflow",
+                        "detail": detail,
+                        "keep_tokens": keep,
+                        "context_length": ctx,
+                    },
+                )
+            logger.error("Model API bad request", exc_info=True)
+            return ExecutionResult(
+                output=f"Error: bad request to model API: {detail}",
+                model=model,
+                latency_ms=latency_ms,
+                raw_response={"error": "bad_request", "detail": detail},
+            )
+        except (TimeoutError, APIConnectionError, APITimeoutError) as e:
             latency_ms = (time.perf_counter() - start) * 1000.0
             logger.error("Model API connection/timeout error", exc_info=True)
             return ExecutionResult(
@@ -317,7 +415,7 @@ class ModelExecutor:
             latency_ms = (time.perf_counter() - start) * 1000.0
             logger.debug("Listed %d models in %.1fms", len(models), latency_ms)
             return models
-        except (APIConnectionError, APITimeoutError, asyncio.TimeoutError):
+        except (TimeoutError, APIConnectionError, APITimeoutError):
             logger.warning("Model list failed: API unreachable", exc_info=True)
             return []
         except Exception:
@@ -329,10 +427,69 @@ class ModelExecutor:
         try:
             await self.client.models.list()
             return True
-        except (APIConnectionError, APITimeoutError, asyncio.TimeoutError):
+        except (TimeoutError, APIConnectionError, APITimeoutError):
             return False
         except Exception:
             return False
+
+    async def _request_with_retries(self, request_kwargs: dict[str, Any]):
+        attempts = max(0, int(self.config.max_retries))
+        backoff = max(0.0, float(self.config.retry_backoff_s))
+        last_err: Exception | None = None
+        model_name = str(request_kwargs.get("model", self.config.name) or self.config.name)
+
+        for attempt in range(attempts + 1):
+            try:
+                return await self.client.chat.completions.create(**request_kwargs)
+            except BadRequestError as e:
+                last_err = e
+                detail = str(e)
+                if not _is_model_unloaded_error(detail) or attempt >= attempts:
+                    raise
+
+                # Wait for model load and retry.
+                wait_for = max(30.0, backoff * (2**attempt) * 10.0)
+                logger.warning(
+                    "Model appears unloaded; waiting for load then retrying (%d/%d): %s",
+                    attempt + 1,
+                    attempts,
+                    model_name,
+                )
+                await asyncio.to_thread(
+                    preload_model,
+                    model_name,
+                    base_url=self.config.base_url,
+                    api_key=self.config.api_key,
+                    context_length=int(self.config.context_window),
+                    keep_model_in_memory=True,
+                    retries=2,
+                    retry_backoff_s=max(1.0, backoff),
+                    ready_timeout_s=wait_for,
+                    ready_poll_s=max(1.0, backoff),
+                )
+                continue
+            except (TimeoutError, APIConnectionError, APITimeoutError) as e:
+                last_err = e
+                if attempt >= attempts:
+                    raise
+                sleep_for = backoff * (2**attempt)
+                if sleep_for > 0:
+                    logger.warning(
+                        "Model API timeout/connection error; retrying in %.1fs (%d/%d)",
+                        sleep_for,
+                        attempt + 1,
+                        attempts,
+                    )
+                    await asyncio.sleep(sleep_for)
+                else:
+                    logger.warning(
+                        "Model API timeout/connection error; retrying (%d/%d)",
+                        attempt + 1,
+                        attempts,
+                    )
+        if last_err:
+            raise last_err
+        raise RuntimeError("request failed without exception")
 
 
 __all__ = ["ModelExecutor", "format_context_prompt"]

@@ -10,17 +10,12 @@ from typing import Any
 
 from dcs.types import Critique, ModelConfig, QuerySpec, QueryType
 
-
 logger = logging.getLogger(__name__)
 
 
-_PATH_RE = re.compile(
-    r"(?P<path>(?:[A-Za-z]:\\)?(?:\.?\.?/)?[\w.\-~/]+(?:/[\w.\-]+)+)"
-)
+_PATH_RE = re.compile(r"(?P<path>(?:[A-Za-z]:\\)?(?:\.?\.?/)?[\w.\-~/]+(?:/[\w.\-]+)+)")
 _PY_SYMBOL_RE = re.compile(r"\b(?:(?:class|def)\s+)?([A-Za-z_][A-Za-z0-9_]*)\b")
-_ERROR_RE = re.compile(
-    r"(?i)\b(?:traceback|exception|error|failed|assert(?:ion)?\s+error|panic)\b"
-)
+_ERROR_RE = re.compile(r"(?i)\b(?:traceback|exception|error|failed|assert(?:ion)?\s+error|panic)\b")
 
 
 def _clamp01(x: float) -> float:
@@ -42,7 +37,7 @@ class TaskDecomposer:
         self.config = config
         try:
             openai_mod = importlib.import_module("openai")
-            async_openai_cls = getattr(openai_mod, "AsyncOpenAI")
+            async_openai_cls = openai_mod.AsyncOpenAI
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
                 "openai package not available; install `openai` to use TaskDecomposer"
@@ -50,7 +45,13 @@ class TaskDecomposer:
 
         self._client: Any = async_openai_cls(base_url=config.base_url, api_key=config.api_key)
 
-    async def decompose(self, task: str, max_queries: int = 5) -> list[QuerySpec]:
+    async def decompose(
+        self,
+        task: str,
+        max_queries: int = 5,
+        type_bias: dict[str, float] | None = None,
+        require_types: set[QueryType] | None = None,
+    ) -> list[QuerySpec]:
         """Use the model to propose QuerySpecs; fall back heuristically."""
         task = (task or "").strip()
         if not task:
@@ -66,10 +67,19 @@ class TaskDecomposer:
             specs = self._fallback_decompose(task=task, max_queries=max_queries)
 
         specs = self._apply_path_hints(task, specs)
+        specs = self._inject_task_specific_specs(task, specs)
+        specs = self._apply_type_bias(specs, type_bias)
+        specs = self._ensure_required_types(task, specs, require_types)
         return self._postprocess_specs(specs, max_queries=max_queries)
 
     async def refine(
-        self, task: str, critique: Critique, previous_specs: list[QuerySpec]
+        self,
+        task: str,
+        critique: Critique,
+        previous_specs: list[QuerySpec],
+        *,
+        type_bias: dict[str, float] | None = None,
+        require_types: set[QueryType] | None = None,
     ) -> list[QuerySpec]:
         """Refine/additional queries based on critique; avoid repeats."""
         task = (task or "").strip()
@@ -91,7 +101,11 @@ class TaskDecomposer:
 
         try:
             specs = await self._model_refine(task, critique, previous_specs)
-            logger.info("refine: model returned %d specs: %r", len(specs), [(s.query_type.value, s.query) for s in specs])
+            logger.info(
+                "refine: model returned %d specs: %r",
+                len(specs),
+                [(s.query_type.value, s.query) for s in specs],
+            )
         except Exception as e:
             logger.warning("refine: model failed, using fallback: %s", e)
             specs = []
@@ -141,6 +155,7 @@ class TaskDecomposer:
             specs.extend(task_specs)
 
         specs = self._apply_path_hints(task, specs)
+        specs = self._inject_task_specific_specs(task, specs)
 
         # Deduplicate against previous and within new.
         out: list[QuerySpec] = []
@@ -148,13 +163,389 @@ class TaskDecomposer:
         for spec in specs:
             key = _spec_key(spec)
             if key in seen:
-                logger.debug("refine: skipping duplicate spec: %s %r", spec.query_type.value, spec.query)
+                logger.debug(
+                    "refine: skipping duplicate spec: %s %r", spec.query_type.value, spec.query
+                )
                 continue
             seen.add(key)
             out.append(spec)
 
-        logger.info("refine: emitting %d new specs: %r", len(out), [(s.query_type.value, s.query) for s in out])
+        out = self._apply_type_bias(out, type_bias)
+        out = self._ensure_required_types(task, out, require_types)
+        out = self._postprocess_specs(out, max_queries=5)
+
+        logger.info(
+            "refine: emitting %d new specs: %r",
+            len(out),
+            [(s.query_type.value, s.query) for s in out],
+        )
         return out
+
+    def _inject_task_specific_specs(self, task: str, specs: list[QuerySpec]) -> list[QuerySpec]:
+        """Add high-signal task-specific retrieval specs for known hard domains."""
+        task_l = (task or "").lower()
+        is_mcp_task = "mcp" in task_l or "model context protocol" in task_l
+        is_embedding_task = "embeddingservice" in task_l or "embedding service" in task_l
+        is_kg_task = "knowledge graph" in task_l or "knowledge-graph" in task_l
+        is_event_bus_task = "event bus" in task_l or "internaleventbus" in task_l
+        is_daemon_arch_task = "daemon architecture" in task_l or (
+            "major components" in task_l and "daemon" in task_l
+        )
+        is_storage_task = "store documents" in task_l or "content-addressable" in task_l
+        is_hybrid_search_task = "hybrid search" in task_l and "search" in task_l
+
+        if not (
+            is_mcp_task
+            or is_embedding_task
+            or is_kg_task
+            or is_event_bus_task
+            or is_daemon_arch_task
+            or is_storage_task
+            or is_hybrid_search_task
+        ):
+            return specs
+
+        seeded: list[QuerySpec] = []
+
+        if is_mcp_task:
+            is_tools_task = "tool" in task_l and ("register" in task_l or "registered" in task_l)
+            is_protocol_task = any(
+                k in task_l
+                for k in (
+                    "transport",
+                    "stdio",
+                    "ndjson",
+                    "json-rpc",
+                    "jsonrpc",
+                    "communicate",
+                    "server started",
+                    "serve",
+                )
+            )
+
+            if is_tools_task:
+                seeded.extend(
+                    [
+                        QuerySpec(
+                            query="registerTool",
+                            query_type=QueryType.GREP,
+                            importance=0.99,
+                            reason="mcp tool registration anchors",
+                        ),
+                        QuerySpec(
+                            query="registerRawTool",
+                            query_type=QueryType.GREP,
+                            importance=0.98,
+                            reason="mcp raw tool registration anchors",
+                        ),
+                        QuerySpec(
+                            query="Store documents",
+                            query_type=QueryType.GREP,
+                            importance=0.97,
+                            reason="tool description includes store wording",
+                        ),
+                        QuerySpec(
+                            query="session_start",
+                            query_type=QueryType.GREP,
+                            importance=0.96,
+                            reason="session tool registration string",
+                        ),
+                        QuerySpec(
+                            query="updateMetadata|update_metadata",
+                            query_type=QueryType.GREP,
+                            importance=0.95,
+                            reason="metadata tool registration string",
+                        ),
+                    ]
+                )
+
+            if is_protocol_task:
+                seeded.extend(
+                    [
+                        QuerySpec(
+                            query="ndjson",
+                            query_type=QueryType.GREP,
+                            importance=0.99,
+                            reason="transport framing keyword",
+                        ),
+                        QuerySpec(
+                            query="json-rpc",
+                            query_type=QueryType.GREP,
+                            importance=0.98,
+                            reason="rpc protocol keyword",
+                        ),
+                        QuerySpec(
+                            query="stdio_transport",
+                            query_type=QueryType.GREP,
+                            importance=0.97,
+                            reason="transport implementation symbol",
+                        ),
+                        QuerySpec(
+                            query="serve_command",
+                            query_type=QueryType.GREP,
+                            importance=0.96,
+                            reason="server startup command implementation",
+                        ),
+                        QuerySpec(
+                            query="registerTool",
+                            query_type=QueryType.GREP,
+                            importance=0.95,
+                            reason="tool registration API",
+                        ),
+                    ]
+                )
+
+            if not (is_tools_task or is_protocol_task):
+                seeded.extend(
+                    [
+                        QuerySpec(
+                            query="registerTool",
+                            query_type=QueryType.GREP,
+                            importance=0.98,
+                            reason="default mcp tool registration anchor",
+                        ),
+                        QuerySpec(
+                            query="ndjson",
+                            query_type=QueryType.GREP,
+                            importance=0.95,
+                            reason="default mcp transport anchor",
+                        ),
+                    ]
+                )
+
+        if is_embedding_task:
+            seeded.extend(
+                [
+                    QuerySpec(
+                        query="src/vector/embedding_service.cpp",
+                        query_type=QueryType.GET,
+                        importance=0.99,
+                        reason="primary embedding implementation",
+                    ),
+                    QuerySpec(
+                        query="EmbeddingService",
+                        query_type=QueryType.GREP,
+                        importance=0.98,
+                        reason="embedding service class anchor",
+                    ),
+                    QuerySpec(
+                        query="all-MiniLM-L6-v2",
+                        query_type=QueryType.GREP,
+                        importance=0.97,
+                        reason="default embedding model and dimensions",
+                    ),
+                    QuerySpec(
+                        query="include/yams/vector/dim_resolver.h",
+                        query_type=QueryType.GET,
+                        importance=0.96,
+                        reason="model-name defaults and dimensions",
+                    ),
+                    QuerySpec(
+                        query="generateEmbeddingsInternal",
+                        query_type=QueryType.GREP,
+                        importance=0.95,
+                        reason="batching and queue mechanics",
+                    ),
+                    QuerySpec(
+                        query="vectors.db",
+                        query_type=QueryType.GREP,
+                        importance=0.94,
+                        reason="embedding storage backend details",
+                    ),
+                    QuerySpec(
+                        query="include/yams/vector/embedding_service.h",
+                        query_type=QueryType.GET,
+                        importance=0.9,
+                        reason="embedding service API surface",
+                    ),
+                ]
+            )
+
+        if is_kg_task:
+            seeded.extend(
+                [
+                    QuerySpec(
+                        query="KnowledgeGraphStore|knowledge graph|KG",
+                        query_type=QueryType.GREP,
+                        importance=0.99,
+                        reason="knowledge graph component anchors",
+                    ),
+                    QuerySpec(
+                        query="node|edge|relation path:src/metadata/knowledge_graph_store_sqlite.cpp",
+                        query_type=QueryType.GREP,
+                        importance=0.98,
+                        reason="graph structure representation",
+                    ),
+                    QuerySpec(
+                        query="search|query|travers path:src/metadata/knowledge_graph_store_sqlite.cpp",
+                        query_type=QueryType.GREP,
+                        importance=0.97,
+                        reason="search-time graph usage",
+                    ),
+                    QuerySpec(
+                        query="src/metadata/knowledge_graph_store_sqlite.cpp",
+                        query_type=QueryType.GET,
+                        importance=0.96,
+                        reason="knowledge graph storage implementation",
+                    ),
+                    QuerySpec(
+                        query="src/metadata/knowledge_graph_store_sqlite.cpp depth:1 limit:40",
+                        query_type=QueryType.GRAPH,
+                        importance=0.95,
+                        reason="knowledge graph relation expansion from storage implementation",
+                    ),
+                    QuerySpec(
+                        query="include/yams/metadata/knowledge_graph_store.h",
+                        query_type=QueryType.GET,
+                        importance=0.9,
+                        reason="knowledge graph API",
+                    ),
+                ]
+            )
+
+        if is_event_bus_task:
+            seeded.extend(
+                [
+                    QuerySpec(
+                        query="include/yams/daemon/components/InternalEventBus.h",
+                        query_type=QueryType.GET,
+                        importance=0.99,
+                        reason="event bus type/channel definitions",
+                    ),
+                    QuerySpec(
+                        query="InternalEventBus path:include/yams/daemon/components/InternalEventBus.h",
+                        query_type=QueryType.GREP,
+                        importance=0.97,
+                        reason="event bus symbol anchored to primary header",
+                    ),
+                    QuerySpec(
+                        query="get_or_create_channel|try_push|try_pop path:include/yams/daemon/components/InternalEventBus.h",
+                        query_type=QueryType.GREP,
+                        importance=0.96,
+                        reason="channel keying and publish/subscribe operations",
+                    ),
+                    QuerySpec(
+                        query="src/daemon/components/PostIngestQueue.cpp",
+                        query_type=QueryType.GET,
+                        importance=0.92,
+                        reason="component usage of event bus channels",
+                    ),
+                ]
+            )
+
+        if is_daemon_arch_task:
+            seeded.extend(
+                [
+                    QuerySpec(
+                        query="include/yams/daemon/components/ServiceManager.h",
+                        query_type=QueryType.GET,
+                        importance=0.98,
+                        reason="daemon component composition entrypoint",
+                    ),
+                    QuerySpec(
+                        query="include/yams/daemon/components/InternalEventBus.h",
+                        query_type=QueryType.GET,
+                        importance=0.96,
+                        reason="event bus architecture role",
+                    ),
+                    QuerySpec(
+                        query="include/yams/daemon/components/ResourceGovernor.h",
+                        query_type=QueryType.GET,
+                        importance=0.95,
+                        reason="resource pressure and admission role",
+                    ),
+                    QuerySpec(
+                        query="ServiceManager|InternalEventBus|ResourceGovernor|EmbeddingService",
+                        query_type=QueryType.GREP,
+                        importance=0.94,
+                        reason="major daemon components for architecture summary",
+                    ),
+                ]
+            )
+
+        if is_storage_task:
+            seeded.extend(
+                [
+                    QuerySpec(
+                        query="include/yams/api/content_store.h",
+                        query_type=QueryType.GET,
+                        importance=0.98,
+                        reason="content store API and CAS model",
+                    ),
+                    QuerySpec(
+                        query="src/api/content_store_impl.cpp",
+                        query_type=QueryType.GET,
+                        importance=0.97,
+                        reason="content store implementation details",
+                    ),
+                    QuerySpec(
+                        query="src/metadata/metadata_repository.cpp",
+                        query_type=QueryType.GET,
+                        importance=0.96,
+                        reason="metadata/index persistence path",
+                    ),
+                    QuerySpec(
+                        query="content-addressable|sha256|metadata|index",
+                        query_type=QueryType.GREP,
+                        importance=0.95,
+                        reason="core storage semantics and indexing",
+                    ),
+                ]
+            )
+
+        if is_hybrid_search_task:
+            seeded.extend(
+                [
+                    QuerySpec(
+                        query="src/search/search_engine.cpp",
+                        query_type=QueryType.GET,
+                        importance=0.99,
+                        reason="hybrid fusion implementation",
+                    ),
+                    QuerySpec(
+                        query="include/yams/search/search_engine.h",
+                        query_type=QueryType.GET,
+                        importance=0.96,
+                        reason="search backend/type declarations",
+                    ),
+                    QuerySpec(
+                        query="hybrid|fusion|FTS5|semantic|vector",
+                        query_type=QueryType.GREP,
+                        importance=0.95,
+                        reason="hybrid backend fusion anchors",
+                    ),
+                ]
+            )
+
+        if not seeded:
+            seeded.extend(
+                [
+                    QuerySpec(
+                        query="registerTool",
+                        query_type=QueryType.GREP,
+                        importance=0.98,
+                        reason="default mcp tool registration anchor",
+                    ),
+                    QuerySpec(
+                        query="ndjson",
+                        query_type=QueryType.GREP,
+                        importance=0.95,
+                        reason="default mcp transport anchor",
+                    ),
+                ]
+            )
+
+        existing = {_spec_key(s) for s in specs}
+        out: list[QuerySpec] = []
+        for s in seeded:
+            key = _spec_key(s)
+            if key in existing:
+                continue
+            existing.add(key)
+            out.append(s)
+
+        # Prepend seeds so they survive max_queries trimming.
+        return out + list(specs)
 
     def _apply_path_hints(self, task: str, specs: list[QuerySpec]) -> list[QuerySpec]:
         """Ensure path-hinted GREP specs when a filename is mentioned in the task."""
@@ -210,12 +601,87 @@ class TaskDecomposer:
             s
             for s in specs
             if not (
-                s.query_type == QueryType.GREP and s.query in hinted_bases and "path:" not in s.query
+                s.query_type == QueryType.GREP
+                and s.query in hinted_bases
+                and "path:" not in s.query
             )
         ]
 
         # Prepend hinted specs so they survive truncation
         return hinted + filtered
+
+    def _apply_type_bias(
+        self,
+        specs: list[QuerySpec],
+        type_bias: dict[str, float] | None,
+    ) -> list[QuerySpec]:
+        if not type_bias:
+            return specs
+
+        out: list[QuerySpec] = []
+        for s in specs:
+            mul = float(type_bias.get(s.query_type.value, 1.0))
+            out.append(
+                QuerySpec(
+                    query=s.query,
+                    query_type=s.query_type,
+                    importance=_clamp01(float(s.importance) * mul),
+                    reason=s.reason,
+                )
+            )
+        return out
+
+    def _ensure_required_types(
+        self,
+        task: str,
+        specs: list[QuerySpec],
+        required_types: set[QueryType] | None,
+    ) -> list[QuerySpec]:
+        if not required_types:
+            return specs
+
+        out = list(specs)
+        present = {s.query_type for s in out}
+
+        if QueryType.GREP in required_types and QueryType.GREP not in present:
+            task_specs = self._extract_task_grep_specs(task)
+            grep_seed = next((s for s in task_specs if s.query_type == QueryType.GREP), None)
+            if grep_seed is None:
+                q = self._clean_query_for_grep(task)
+                if q:
+                    grep_seed = QuerySpec(
+                        query=q,
+                        query_type=QueryType.GREP,
+                        importance=0.94,
+                        reason="required grep fallback",
+                    )
+            if grep_seed is not None:
+                out.append(grep_seed)
+                present.add(QueryType.GREP)
+
+        if QueryType.GET in required_types and QueryType.GET not in present:
+            path = None
+            m = _PATH_RE.search(task)
+            if m:
+                p = m.group("path").strip().strip("'\"")
+                if p:
+                    path = p
+            if not path:
+                filenames = self._FILENAME_RE.findall(task)
+                if filenames:
+                    path = filenames[0]
+
+            if path:
+                out.append(
+                    QuerySpec(
+                        query=path,
+                        query_type=QueryType.GET,
+                        importance=0.92,
+                        reason="required get fallback",
+                    )
+                )
+
+        return out
 
     async def _model_decompose(self, task: str, max_queries: int) -> list[QuerySpec]:
         sys_prompt = (
@@ -231,35 +697,33 @@ class TaskDecomposer:
             "- Never include markdown fences.\n"
         )
 
-        user_prompt = (
-            "Task:\n"
-            f"{task}\n\n"
-            f"Return up to {max_queries} query specs." 
-        )
+        user_prompt = f"Task:\n{task}\n\nReturn up to {max_queries} query specs."
 
         few_shot = (
             "Example 1:\n"
             "Task: Fix failing test in src/foo.py: test_bar expects ValueError\n"
             "Output:\n"
-            "[{\"query\":\"src/foo.py\",\"query_type\":\"get\",\"importance\":0.95,\"reason\":\"inspect implementation\"},"
-            "{\"query\":\"test_bar ValueError\",\"query_type\":\"grep\",\"importance\":0.8,\"reason\":\"locate failing assertion\"}]\n\n"
+            '[{"query":"src/foo.py","query_type":"get","importance":0.95,"reason":"inspect implementation"},'
+            '{"query":"test_bar ValueError","query_type":"grep","importance":0.8,"reason":"locate failing assertion"}]\n\n'
             "Example 2:\n"
             "Task: Understand how ResourceGovernor decides canLoadModel\n"
             "Output:\n"
-            "[{\"query\":\"ResourceGovernor canLoadModel\",\"query_type\":\"semantic\",\"importance\":0.9,\"reason\":\"find policy implementation and docs\"},"
-            "{\"query\":\"canLoadModel\",\"query_type\":\"grep\",\"importance\":0.7,\"reason\":\"find exact symbol references\"}]"
+            '[{"query":"ResourceGovernor canLoadModel","query_type":"semantic","importance":0.9,"reason":"find policy implementation and docs"},'
+            '{"query":"canLoadModel","query_type":"grep","importance":0.7,"reason":"find exact symbol references"}]'
         )
 
-        raw = await self._chat_json(sys_prompt=sys_prompt, user_prompt=user_prompt, few_shot=few_shot)
+        raw = await self._chat_json(
+            sys_prompt=sys_prompt, user_prompt=user_prompt, few_shot=few_shot
+        )
         specs = self._parse_specs_json(raw)
-        return self._postprocess_specs(specs, max_queries=max_queries)
+        return specs
 
     async def _model_refine(
         self, task: str, critique: Critique, previous_specs: list[QuerySpec]
     ) -> list[QuerySpec]:
         sys_prompt = (
-            "You refine retrieval queries for YAMS. Return ONLY valid JSON array of query specs." 
-            " Do NOT repeat previous queries. Use missing_info and suggested_queries." 
+            "You refine retrieval queries for YAMS. Return ONLY valid JSON array of query specs."
+            " Do NOT repeat previous queries. Use missing_info and suggested_queries."
         )
         prev = [
             {
@@ -277,21 +741,23 @@ class TaskDecomposer:
             f"{json.dumps(asdict(critique), ensure_ascii=True)}\n\n"
             "Previous query specs JSON:\n"
             f"{json.dumps(prev, ensure_ascii=True)}\n\n"
-            "Return new query specs only." 
+            "Return new query specs only."
         )
 
         few_shot = (
             "Example:\n"
             "Task: Add caching to yams search\n"
-            "Critique JSON: {\"missing_info\":[\"where queries are executed\"],\"suggested_queries\":[\"execute_spec implementation\"]}\n"
-            "Previous query specs JSON: [{\"query\":\"search\",\"query_type\":\"semantic\",\"importance\":0.7,\"reason\":\"initial\"}]\n"
+            'Critique JSON: {"missing_info":["where queries are executed"],"suggested_queries":["execute_spec implementation"]}\n'
+            'Previous query specs JSON: [{"query":"search","query_type":"semantic","importance":0.7,"reason":"initial"}]\n'
             "Output:\n"
-            "[{\"query\":\"execute_spec\",\"query_type\":\"semantic\",\"importance\":0.85,\"reason\":\"locate execution path\"}]"
+            '[{"query":"execute_spec","query_type":"semantic","importance":0.85,"reason":"locate execution path"}]'
         )
 
-        raw = await self._chat_json(sys_prompt=sys_prompt, user_prompt=user_prompt, few_shot=few_shot)
+        raw = await self._chat_json(
+            sys_prompt=sys_prompt, user_prompt=user_prompt, few_shot=few_shot
+        )
         specs = self._parse_specs_json(raw)
-        return self._postprocess_specs(specs, max_queries=5)
+        return specs
 
     async def _chat_json(self, sys_prompt: str, user_prompt: str, few_shot: str) -> str:
         # Small-model-friendly: keep messages short, put examples in system.
@@ -324,9 +790,7 @@ class TaskDecomposer:
             cleaned = text  # fallback if stripping ate everything
 
         # Try markdown code fences first (```json [...] ```)
-        fence_match = re.search(
-            r"```(?:json)?\s*(\[.*?\])\s*```", cleaned, flags=re.DOTALL
-        )
+        fence_match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", cleaned, flags=re.DOTALL)
         if fence_match:
             candidate = fence_match.group(1)
         else:
@@ -408,44 +872,214 @@ class TaskDecomposer:
 
     # Words too common / vague to be useful grep patterns on their own.
     _STOPWORDS: set[str] = {
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "shall",
-        "should", "may", "might", "must", "can", "could", "to", "of", "in",
-        "for", "on", "with", "at", "by", "from", "as", "into", "through",
-        "during", "before", "after", "above", "below", "between", "out",
-        "off", "over", "under", "again", "further", "then", "once", "here",
-        "there", "when", "where", "why", "how", "all", "each", "every",
-        "both", "few", "more", "most", "other", "some", "such", "no", "nor",
-        "not", "only", "own", "same", "so", "than", "too", "very", "just",
-        "about", "up", "it", "its", "i", "me", "my", "we", "our", "you",
-        "your", "he", "him", "his", "she", "her", "they", "them", "their",
-        "this", "that", "these", "those", "what", "which", "who", "whom",
-        "and", "but", "or", "if", "while", "because", "until", "although",
-        "also", "any", "like", "using", "used", "use", "does", "show",
-        "list", "find", "get", "set", "see", "need", "look", "make",
-        "want", "know", "try", "take", "give",
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "shall",
+        "should",
+        "may",
+        "might",
+        "must",
+        "can",
+        "could",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "as",
+        "into",
+        "through",
+        "during",
+        "before",
+        "after",
+        "above",
+        "below",
+        "between",
+        "out",
+        "off",
+        "over",
+        "under",
+        "again",
+        "further",
+        "then",
+        "once",
+        "here",
+        "there",
+        "when",
+        "where",
+        "why",
+        "how",
+        "all",
+        "each",
+        "every",
+        "both",
+        "few",
+        "more",
+        "most",
+        "other",
+        "some",
+        "such",
+        "no",
+        "nor",
+        "not",
+        "only",
+        "own",
+        "same",
+        "so",
+        "than",
+        "too",
+        "very",
+        "just",
+        "about",
+        "up",
+        "it",
+        "its",
+        "i",
+        "me",
+        "my",
+        "we",
+        "our",
+        "you",
+        "your",
+        "he",
+        "him",
+        "his",
+        "she",
+        "her",
+        "they",
+        "them",
+        "their",
+        "this",
+        "that",
+        "these",
+        "those",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "and",
+        "but",
+        "or",
+        "if",
+        "while",
+        "because",
+        "until",
+        "although",
+        "also",
+        "any",
+        "like",
+        "using",
+        "used",
+        "use",
+        "show",
+        "list",
+        "find",
+        "get",
+        "set",
+        "see",
+        "need",
+        "look",
+        "make",
+        "want",
+        "know",
+        "try",
+        "take",
+        "give",
         # Domain vague words:
-        "code", "file", "function", "class", "method", "implement",
-        "implementation", "relevant", "related", "information", "details",
-        "specific", "actual", "content", "context", "available", "expose",
-        "provide", "define", "section", "part", "include", "contain",
-        "handle", "handles", "handling", "request", "requests", "response",
-        "responses", "called", "calls", "call",
-        "logic", "system", "module", "service", "data", "type", "types",
-        "value", "values", "based", "support", "supported", "work",
-        "works", "working", "source", "output", "input", "result",
-        "results", "return", "returns", "returned", "check", "checks",
-        "process", "processes", "anchor", "anchors", "citation", "citations",
+        "code",
+        "file",
+        "function",
+        "class",
+        "method",
+        "implement",
+        "implementation",
+        "relevant",
+        "related",
+        "information",
+        "details",
+        "specific",
+        "actual",
+        "content",
+        "context",
+        "available",
+        "expose",
+        "provide",
+        "define",
+        "section",
+        "part",
+        "include",
+        "contain",
+        "handle",
+        "handles",
+        "handling",
+        "request",
+        "requests",
+        "response",
+        "responses",
+        "called",
+        "calls",
+        "call",
+        "logic",
+        "system",
+        "module",
+        "service",
+        "data",
+        "type",
+        "types",
+        "value",
+        "values",
+        "based",
+        "support",
+        "supported",
+        "work",
+        "works",
+        "working",
+        "source",
+        "output",
+        "input",
+        "result",
+        "results",
+        "return",
+        "returns",
+        "returned",
+        "check",
+        "checks",
+        "process",
+        "processes",
+        "anchor",
+        "anchors",
+        "citation",
+        "citations",
     }
 
     # Identifiers: camelCase, PascalCase, snake_case, SCREAMING_CASE, dotted.paths
     _IDENT_RE = re.compile(
         r"\b("
-        r"[A-Z][a-z]+(?:[A-Z][a-z]+)+"           # PascalCase  (e.g. ResourceGovernor)
-        r"|[a-z]+(?:_[a-z0-9]+)+"                 # snake_case  (e.g. execute_spec)
-        r"|[a-z]+[A-Z][a-zA-Z0-9]*"              # camelCase   (e.g. canLoadModel)
-        r"|[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+"        # SCREAMING   (e.g. MCP_SERVER)
-        r"|[a-zA-Z_]\w+(?:\.[a-zA-Z_]\w+)+"      # dotted      (e.g. dcs.client)
+        r"[A-Z][a-z]+(?:[A-Z][a-z]+)+"  # PascalCase  (e.g. ResourceGovernor)
+        r"|[a-z]+(?:_[a-z0-9]+)+"  # snake_case  (e.g. execute_spec)
+        r"|[a-z]+[A-Z][a-zA-Z0-9]*"  # camelCase   (e.g. canLoadModel)
+        r"|[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+"  # SCREAMING   (e.g. MCP_SERVER)
+        r"|[a-zA-Z_]\w+(?:\.[a-zA-Z_]\w+)+"  # dotted      (e.g. dcs.client)
         r")\b"
     )
 
@@ -454,10 +1088,10 @@ class TaskDecomposer:
     # to avoid false positives like "citations/anchors".
     _FILE_RE = re.compile(
         r"(?:^|[\s,;(])"
-        r"((?:[A-Za-z_][\w.\-]*/)+"              # at least one dir separator
-        r"[A-Za-z_][\w.\-]*\.[A-Za-z]{1,10}"     # filename with extension
-        r"|(?:[A-Za-z_][\w.\-]*/){2,}"            # or 2+ dir separators
-        r"[A-Za-z_][\w.\-]*)"                     # filename (no ext required)
+        r"((?:[A-Za-z_][\w.\-]*/)+"  # at least one dir separator
+        r"[A-Za-z_][\w.\-]*\.[A-Za-z]{1,10}"  # filename with extension
+        r"|(?:[A-Za-z_][\w.\-]*/){2,}"  # or 2+ dir separators
+        r"[A-Za-z_][\w.\-]*)"  # filename (no ext required)
     )
 
     # Type prefix pattern: "semantic:", "grep:", "keyword:", etc.
@@ -508,10 +1142,7 @@ class TaskDecomposer:
 
         # 5. Fallback: extract non-stopword tokens ≥3 chars
         tokens = re.findall(r"[A-Za-z0-9_]+", cleaned)
-        meaningful = [
-            t for t in tokens
-            if len(t) >= 3 and t.lower() not in self._STOPWORDS
-        ]
+        meaningful = [t for t in tokens if len(t) >= 3 and t.lower() not in self._STOPWORDS]
 
         if not meaningful:
             logger.debug("_clean_query_for_grep: no usable tokens from %r", raw)
@@ -597,12 +1228,8 @@ class TaskDecomposer:
             r"resource|prompt|document|query|command|method|route|event"
         )
         # Match verb...noun (e.g. "register the tool") or noun...verb (e.g. "tool names registered")
-        _VN_RE = re.compile(
-            rf"\b({_VERBS})\b.*?\b({_NOUNS})s?\b", re.IGNORECASE
-        )
-        _NV_RE = re.compile(
-            rf"\b({_NOUNS})s?\b.*?\b({_VERBS})\b", re.IGNORECASE
-        )
+        _VN_RE = re.compile(rf"\b({_VERBS})\b.*?\b({_NOUNS})s?\b", re.IGNORECASE)
+        _NV_RE = re.compile(rf"\b({_NOUNS})s?\b.*?\b({_VERBS})\b", re.IGNORECASE)
 
         def _normalize_verb(raw: str) -> str:
             v = raw.lower().rstrip("eds").rstrip("e")

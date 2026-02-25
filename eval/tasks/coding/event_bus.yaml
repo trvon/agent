@@ -4,6 +4,14 @@ description: >
   Describe the InternalEventBus used in the YAMS daemon. How are
   typed channels keyed, and how do components subscribe and publish events?
 ground_truth:
+  files:
+    - include/yams/daemon/components/InternalEventBus.h
+    - src/daemon/components/PostIngestQueue.cpp
+  symbols:
+    - InternalEventBus
+    - get_or_create_channel
+    - try_push
+    - try_pop
   patterns:
     - InternalEventBus
     - re:channel|typed

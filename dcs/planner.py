@@ -8,7 +8,6 @@ from typing import Any, Protocol
 
 from dcs.types import QuerySpec, QueryType, YAMSChunk, YAMSQueryResult
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -26,9 +25,7 @@ class YAMSClientLike(Protocol):
     async def execute_spec(self, spec: QuerySpec) -> YAMSQueryResult: ...
 
 
-_PATH_RE = re.compile(
-    r"(?P<path>(?:[A-Za-z]:\\)?(?:\.?\.?/)?[\w.\-~/]+(?:/[\w.\-]+)+)"
-)
+_PATH_RE = re.compile(r"(?P<path>(?:[A-Za-z]:\\)?(?:\.?\.?/)?[\w.\-~/]+(?:/[\w.\-]+)+)")
 _IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
 
 
@@ -48,24 +45,183 @@ def _dedupe_chunks(chunks: list[YAMSChunk]) -> list[YAMSChunk]:
     return out
 
 
+def _is_noise_source(path: str) -> bool:
+    p = (path or "").lower()
+    if not p:
+        return False
+    if "/tests/" in p or "/docs/" in p or "/benchmarks/" in p:
+        return True
+    return p.endswith((".md", ".txt", ".json", ".yaml", ".yml", ".lock"))
+
+
 class QueryPlanner:
     """Maps QuerySpecs to concrete YAMS executions (including expansions)."""
 
     def __init__(self, yams: YAMSClientLike):
         self._yams = yams
 
-    async def execute(self, specs: list[QuerySpec]) -> list[YAMSQueryResult]:
-        """Execute all query specs concurrently; keep input order."""
+    async def execute(
+        self, specs: list[QuerySpec], *, allow_adaptive: bool = True
+    ) -> list[YAMSQueryResult]:
+        """Execute query specs in staged order with graph-guided retrieval.
+
+        Retrieval order is intentionally accuracy-first:
+          1) semantic/list (search)
+          2) graph (explicit + search-driven fanout)
+          3) grep/get (augmented with graph path hints)
+        """
         specs = self._dedupe_specs(specs)
         if not specs:
             return []
 
         t0 = time.perf_counter()
-        tasks = [self._timed_execute_spec(s) for s in specs]
-        results = await asyncio.gather(*tasks)
+        search_specs, graph_specs, grep_get_specs, other_specs = self._partition_specs(specs)
+
+        stage_results: list[YAMSQueryResult] = []
+
+        # Stage 1: lexical/semantic discovery.
+        search_results = await self._execute_specs_batch(search_specs)
+        stage_results.extend(search_results)
+
+        # Stage 2: graph traversal from explicit graph queries and top search anchors.
+        graph_fanout = self._graph_fanout_from_results(search_results)
+        stage2_graph_specs = self._dedupe_specs(list(graph_specs) + graph_fanout)
+        graph_results = await self._execute_specs_batch(stage2_graph_specs)
+        stage_results.extend(graph_results)
+
+        # Stage 3: targeted grep/get with graph-guided file hints.
+        guided_specs = self._apply_graph_guidance(grep_get_specs, graph_results)
+        guided_results = await self._execute_specs_batch(self._dedupe_specs(guided_specs))
+        stage_results.extend(guided_results)
+
+        # Stage 4: any residual query types.
+        tail_results = await self._execute_specs_batch(other_specs)
+        stage_results.extend(tail_results)
+
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        logger.info("executed %d specs in %dms", len(specs), int(dt_ms))
-        return self._merge_results_by_spec(results)
+        logger.info(
+            "executed staged retrieval specs=%d search=%d graph=%d grep_get=%d other=%d in %dms",
+            len(specs),
+            len(search_specs),
+            len(stage2_graph_specs),
+            len(self._dedupe_specs(guided_specs)),
+            len(other_specs),
+            int(dt_ms),
+        )
+        merged = self._merge_results_by_spec(stage_results)
+
+        # Adaptive followups based on actual YAMS output quality.
+        follow_specs = self._adaptive_followups(merged) if allow_adaptive else []
+        if follow_specs:
+            follow_results = await self.execute(
+                self._dedupe_specs(follow_specs), allow_adaptive=False
+            )
+            return self._merge_results_by_spec(merged + follow_results)
+
+        return merged
+
+    async def _execute_specs_batch(self, specs: list[QuerySpec]) -> list[YAMSQueryResult]:
+        if not specs:
+            return []
+        tasks = [self._timed_execute_spec(s) for s in specs]
+        return await asyncio.gather(*tasks)
+
+    def _partition_specs(
+        self, specs: list[QuerySpec]
+    ) -> tuple[list[QuerySpec], list[QuerySpec], list[QuerySpec], list[QuerySpec]]:
+        search_specs: list[QuerySpec] = []
+        graph_specs: list[QuerySpec] = []
+        grep_get_specs: list[QuerySpec] = []
+        other_specs: list[QuerySpec] = []
+
+        for s in specs:
+            if s.query_type in {QueryType.SEMANTIC, QueryType.LIST}:
+                search_specs.append(s)
+            elif s.query_type == QueryType.GRAPH:
+                graph_specs.append(s)
+            elif s.query_type in {QueryType.GREP, QueryType.GET}:
+                grep_get_specs.append(s)
+            else:
+                other_specs.append(s)
+
+        return search_specs, graph_specs, grep_get_specs, other_specs
+
+    def _graph_fanout_from_results(self, results: list[YAMSQueryResult]) -> list[QuerySpec]:
+        out: list[QuerySpec] = []
+        max_graph_specs = 6
+
+        for res in results:
+            if len(out) >= max_graph_specs:
+                break
+            if res.spec.query_type not in {QueryType.SEMANTIC, QueryType.LIST}:
+                continue
+
+            ranked = sorted(res.chunks or [], key=lambda c: float(c.score or 0.0), reverse=True)
+            emitted = 0
+            for c in ranked:
+                if len(out) >= max_graph_specs or emitted >= 2:
+                    break
+                src = self._path_from_chunk(c)
+                if not src or _is_noise_source(src):
+                    continue
+                if "/" not in src and "\\" not in src:
+                    continue
+                out.append(
+                    QuerySpec(
+                        query=f"{src} depth:1 limit:40",
+                        query_type=QueryType.GRAPH,
+                        importance=max(0.5, float(res.spec.importance) - 0.1),
+                        reason="stage: graph fanout from search",
+                    )
+                )
+                emitted += 1
+
+        return out
+
+    def _apply_graph_guidance(
+        self,
+        specs: list[QuerySpec],
+        graph_results: list[YAMSQueryResult],
+    ) -> list[QuerySpec]:
+        if not specs:
+            return []
+
+        graph_paths = self._top_graph_paths(graph_results, limit=10)
+        if not graph_paths:
+            return specs
+
+        out = list(specs)
+        for spec in specs:
+            if spec.query_type == QueryType.GREP:
+                q = (spec.query or "").strip()
+                if not q or "path:" in q:
+                    continue
+                for p in self._select_paths_for_query(q, graph_paths, max_paths=2):
+                    out.append(
+                        QuerySpec(
+                            query=f"{q} path:{p}",
+                            query_type=QueryType.GREP,
+                            importance=min(1.0, float(spec.importance) + 0.05),
+                            reason=self._append_reason(spec.reason, "graph-guided grep path"),
+                        )
+                    )
+            elif spec.query_type == QueryType.GET:
+                q = (spec.query or "").strip()
+                if not q:
+                    continue
+                if "/" in q or "\\" in q:
+                    continue
+                for p in self._select_paths_for_get(q, graph_paths, max_paths=3):
+                    out.append(
+                        QuerySpec(
+                            query=p,
+                            query_type=QueryType.GET,
+                            importance=max(0.9, float(spec.importance)),
+                            reason=self._append_reason(spec.reason, "graph-guided get path"),
+                        )
+                    )
+
+        return out
 
     async def execute_multihop(
         self, specs: list[QuerySpec], depth: int = 2
@@ -86,7 +242,9 @@ class QueryPlanner:
                     continue
                 follow_specs.extend(self._followups_from_result(res, hop=hop))
 
-            follow_specs = [s for s in self._dedupe_specs(follow_specs) if _spec_key(s) not in visited_specs]
+            follow_specs = [
+                s for s in self._dedupe_specs(follow_specs) if _spec_key(s) not in visited_specs
+            ]
             if not follow_specs:
                 break
 
@@ -137,8 +295,56 @@ class QueryPlanner:
 
         dt_ms = (time.perf_counter() - t0) * 1000.0
         res.latency_ms = float(res.latency_ms or dt_ms)
-        res.chunks = _dedupe_chunks(res.chunks or [])
+        res.chunks = self._rank_chunks(spec, _dedupe_chunks(res.chunks or []))
         return res
+
+    def _rank_chunks(self, spec: QuerySpec, chunks: list[YAMSChunk]) -> list[YAMSChunk]:
+        if not chunks:
+            return []
+
+        q_terms = [
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_\-]+", spec.query or "")
+            if len(t) >= 3 and t.lower() not in {"path", "include", "exclude"}
+        ]
+        q_l = (spec.query or "").lower()
+        mentions_tests = any(k in q_l for k in ("test", "benchmark", "docs"))
+
+        ranked: list[YAMSChunk] = []
+        for c in chunks:
+            score = float(c.score or 0.0)
+            src_l = (c.source or "").lower()
+            txt_l = (c.content or "").lower()
+            meta = c.metadata if isinstance(c.metadata, dict) else {}
+
+            if spec.query_type == QueryType.GREP:
+                if bool(meta.get("enriched")):
+                    score += 0.08
+                if bool(meta.get("structured")):
+                    score += 0.06
+                try:
+                    fm = int(meta.get("file_matches") or 0)
+                except Exception:
+                    fm = 0
+                if fm > 0:
+                    score += min(0.12, fm / 150.0)
+
+            if spec.query_type == QueryType.SEMANTIC:
+                if "line=" in txt_l or "char=" in txt_l:
+                    score += 0.06
+
+            if q_terms:
+                hits = sum(1 for t in q_terms if t in txt_l or t in src_l)
+                score += min(0.15, 0.03 * hits)
+
+            if not mentions_tests and _is_noise_source(src_l):
+                score *= 0.70
+
+            c.score = max(0.0, min(1.0, score))
+            ranked.append(c)
+
+        ranked.sort(key=lambda x: (float(x.score or 0.0), x.source, x.chunk_id), reverse=True)
+        return ranked
 
     def _dedupe_specs(self, specs: list[QuerySpec]) -> list[QuerySpec]:
         # Keep first occurrence; callers can pre-sort by importance.
@@ -151,13 +357,142 @@ class QueryPlanner:
             if key in seen:
                 continue
             seen.add(key)
-            out.append(QuerySpec(
-                query=s.query.strip(),
-                query_type=s.query_type,
-                importance=float(max(0.0, min(1.0, s.importance))),
-                reason=s.reason or "",
-            ))
+            out.append(
+                QuerySpec(
+                    query=s.query.strip(),
+                    query_type=s.query_type,
+                    importance=float(max(0.0, min(1.0, s.importance))),
+                    reason=s.reason or "",
+                )
+            )
         return out
+
+    @staticmethod
+    def _append_reason(reason: str, suffix: str) -> str:
+        base = (reason or "").strip()
+        if not base:
+            return suffix
+        if suffix in base:
+            return base
+        return f"{base}; {suffix}"
+
+    @staticmethod
+    def _normalize_path_candidate(raw: str) -> str | None:
+        s = (raw or "").strip().strip("'\"")
+        if not s:
+            return None
+        if s.startswith("path:file:"):
+            s = s[len("path:file:") :]
+        elif s.startswith("file:"):
+            s = s[len("file:") :]
+
+        # Trim structured text artifacts from graph chunk formatting.
+        if " key=" in s:
+            s = s.split(" key=", 1)[0].strip()
+        if " (distance=" in s:
+            s = s.split(" (distance=", 1)[0].strip()
+
+        if s.startswith(("http://", "https://")):
+            return None
+        if "/" not in s and "\\" not in s:
+            return None
+        return s
+
+    @staticmethod
+    def _basename(path: str) -> str:
+        return (path or "").replace("\\", "/").rsplit("/", 1)[-1]
+
+    def _path_from_chunk(self, c: YAMSChunk) -> str | None:
+        candidates: list[str] = []
+        if c.source:
+            candidates.append(c.source)
+
+        meta = c.metadata if isinstance(c.metadata, dict) else {}
+        for key in ("path", "file", "file_path", "label", "nodeKey", "node_key", "name"):
+            v = meta.get(key)
+            if isinstance(v, str) and v.strip():
+                candidates.append(v)
+
+        for cand in candidates:
+            normalized = self._normalize_path_candidate(cand)
+            if normalized:
+                return normalized
+
+        text = (c.content or "").strip()
+        if text:
+            m = _PATH_RE.search(text)
+            if m:
+                normalized = self._normalize_path_candidate(m.group("path"))
+                if normalized:
+                    return normalized
+        return None
+
+    def _top_graph_paths(self, graph_results: list[YAMSQueryResult], limit: int = 10) -> list[str]:
+        scored: dict[str, float] = {}
+        for res in graph_results:
+            for c in res.chunks or []:
+                p = self._path_from_chunk(c)
+                if not p:
+                    continue
+                if _is_noise_source(p):
+                    continue
+                scored[p] = max(scored.get(p, 0.0), float(c.score or 0.0))
+
+        ordered = sorted(scored.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
+        return [p for p, _ in ordered[: max(1, int(limit))]]
+
+    def _select_paths_for_query(
+        self,
+        query: str,
+        paths: list[str],
+        *,
+        max_paths: int,
+    ) -> list[str]:
+        if not paths:
+            return []
+        q_terms = [
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_\-]+", query or "")
+            if len(t) >= 3 and t.lower() not in {"path", "include", "exclude"}
+        ]
+        if not q_terms:
+            return paths[:max_paths]
+
+        scored: list[tuple[int, str]] = []
+        for p in paths:
+            pl = p.lower()
+            base = self._basename(pl)
+            score = sum(1 for t in q_terms if t in pl)
+            if any(t in base for t in q_terms):
+                score += 1
+            scored.append((score, p))
+
+        scored.sort(key=lambda it: (it[0], it[1]), reverse=True)
+        top = [p for s, p in scored if s > 0][:max_paths]
+        if top:
+            return top
+        return paths[:max_paths]
+
+    def _select_paths_for_get(
+        self,
+        query: str,
+        paths: list[str],
+        *,
+        max_paths: int,
+    ) -> list[str]:
+        q = (query or "").strip().lower()
+        if not q:
+            return []
+
+        exact = [p for p in paths if self._basename(p).lower() == q]
+        if exact:
+            return exact[:max_paths]
+
+        partial = [p for p in paths if q in self._basename(p).lower()]
+        if partial:
+            return partial[:max_paths]
+
+        return self._select_paths_for_query(query, paths, max_paths=max_paths)
 
     def _merge_results_by_spec(self, results: list[YAMSQueryResult]) -> list[YAMSQueryResult]:
         merged: dict[tuple[str, str], YAMSQueryResult] = {}
@@ -229,5 +564,115 @@ class QueryPlanner:
                     reason=f"follow-up hop {hop}: symbol mentioned",
                 )
             )
+
+        return follow
+
+    def _adaptive_followups(self, results: list[YAMSQueryResult]) -> list[QuerySpec]:
+        follow: list[QuerySpec] = []
+        max_followups = 8
+
+        for res in results:
+            if len(follow) >= max_followups:
+                break
+
+            chunks = res.chunks or []
+            empty = len(chunks) == 0
+            path_only = all((c.metadata or {}).get("enriched") is False for c in chunks)
+            is_grep = res.spec.query_type == QueryType.GREP
+            is_semantic = res.spec.query_type == QueryType.SEMANTIC
+            is_get = res.spec.query_type == QueryType.GET
+
+            # GREP results empty or path-only -> try GET on referenced paths
+            if is_grep and (empty or path_only):
+                hint_path = None
+                if "path:" in res.spec.query:
+                    hint_path = res.spec.query.split("path:", 1)[1].strip().strip("'\"")
+                if hint_path:
+                    follow.append(
+                        QuerySpec(
+                            query=hint_path,
+                            query_type=QueryType.GET,
+                            importance=max(0.6, res.spec.importance - 0.1),
+                            reason="adaptive: grep path-only -> get",
+                        )
+                    )
+                    continue
+
+                for c in chunks[:3]:
+                    p = self._path_from_chunk(c)
+                    if p:
+                        follow.append(
+                            QuerySpec(
+                                query=p,
+                                query_type=QueryType.GET,
+                                importance=max(0.6, res.spec.importance - 0.1),
+                                reason="adaptive: grep path-only -> get",
+                            )
+                        )
+                    if len(follow) >= max_followups:
+                        break
+                continue
+
+            # SEMANTIC with no hits -> try GREP on identifiers
+            if is_semantic and empty:
+                idents = [m.group(1) for m in _IDENT_RE.finditer(res.spec.query or "")]
+                for ident in idents[:3]:
+                    follow.append(
+                        QuerySpec(
+                            query=ident,
+                            query_type=QueryType.GREP,
+                            importance=max(0.5, res.spec.importance - 0.2),
+                            reason="adaptive: semantic empty -> grep ident",
+                        )
+                    )
+                    if len(follow) >= max_followups:
+                        break
+                continue
+
+            # GET failed -> try GREP on basename
+            if is_get and empty:
+                base = (res.spec.query or "").split("/")[-1]
+                if base:
+                    follow.append(
+                        QuerySpec(
+                            query=base,
+                            query_type=QueryType.GREP,
+                            importance=max(0.5, res.spec.importance - 0.2),
+                            reason="adaptive: get empty -> grep basename",
+                        )
+                    )
+
+            # High-signal file-based chunks -> deterministic graph expansion.
+            # This improves relation discovery for architecture/knowledge-graph tasks.
+            if len(follow) >= max_followups:
+                continue
+
+            if (
+                res.spec.query_type in {QueryType.GREP, QueryType.GET, QueryType.SEMANTIC}
+                and not empty
+            ):
+                # Prefer top scored non-noise sources.
+                ranked = sorted(chunks, key=lambda c: float(c.score or 0.0), reverse=True)
+                emitted = 0
+                for c in ranked:
+                    src = self._path_from_chunk(c) or (c.source or "")
+                    src = (src or "").strip()
+                    if not src:
+                        continue
+                    if _is_noise_source(src):
+                        continue
+                    if "/" not in src and "\\" not in src:
+                        continue
+                    follow.append(
+                        QuerySpec(
+                            query=f"{src} depth:1 limit:40",
+                            query_type=QueryType.GRAPH,
+                            importance=max(0.45, res.spec.importance - 0.15),
+                            reason="adaptive: file anchor -> graph expansion",
+                        )
+                    )
+                    emitted += 1
+                    if emitted >= 2 or len(follow) >= max_followups:
+                        break
 
         return follow

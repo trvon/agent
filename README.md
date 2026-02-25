@@ -18,7 +18,24 @@ uv sync
 dcs run "Explain how YAMS hybrid search works"
 dcs eval eval/tasks/coding/
 dcs compare --models nemotron-nano,qwen3-4b
+# retrieval-only (no generation)
+uv run python benchmarks/retrieval_benchmark.py --task-dir eval/tasks --out results/retrieval_baseline.json
 ```
+
+## Current Defaults
+
+- Executor: `openai/gpt-oss-20b`
+- Critic: `qwen3.5-35b-a3b_moe`
+- No-ground-truth mode: enabled
+- DSPy-first faithfulness extractor: enabled (falls back to deterministic parser)
+
+## Context Profiles
+
+- `--context-profile auto` (default): uses large profile when detected model context window is high.
+- `--context-profile standard`: keeps baseline budgets.
+- `--context-profile large`: forces larger budgets for retrieval/system/output/codemap.
+
+At run start, DCS prints `requested` vs `actual` context window for executor/critic.
 
 ## Requirements
 

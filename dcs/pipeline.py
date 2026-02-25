@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import asdict
 from typing import Any
@@ -13,6 +14,14 @@ from dcs.codemap import CodemapBuilder
 from dcs.critic import SelfCritic
 from dcs.decomposer import TaskDecomposer
 from dcs.executor import ModelExecutor
+from dcs.faithfulness import build_abstention_output, build_faithfulness_report
+from dcs.lmstudio_context import (
+    count_prompt_tokens,
+    get_context_length,
+)
+from dcs.lmstudio_context import (
+    is_available as lmstudio_available,
+)
 from dcs.optimizer import RetrievalOptimizer
 from dcs.planner import QueryPlanner
 from dcs.types import (
@@ -23,6 +32,7 @@ from dcs.types import (
     PipelineConfig,
     PipelineResult,
     QuerySpec,
+    QueryType,
     YAMSQueryResult,
 )
 
@@ -106,6 +116,297 @@ class DCSPipeline:
             kwargs["cwd"] = self.config.yams_cwd
         return kwargs
 
+    def _reconcile_model_context_window(self, model_cfg) -> tuple[int, int]:
+        requested = int(getattr(model_cfg, "context_window", 0) or 0)
+        actual = requested
+        if lmstudio_available():
+            try:
+                detected = get_context_length(str(model_cfg.name or ""))
+                if detected and int(detected) > 0:
+                    actual = int(detected)
+                    model_cfg.context_window = int(detected)
+            except Exception:
+                pass
+        return requested, actual
+
+    def _apply_context_profile(self, executor_ctx_window: int) -> None:
+        profile = str(getattr(self.config, "context_profile", "auto") or "auto").lower()
+        apply_large = profile == "large" or (
+            profile == "auto" and executor_ctx_window >= int(self.config.large_context_threshold)
+        )
+        if not apply_large:
+            return
+
+        changed: list[str] = []
+        if int(self.config.context_budget) == 2048:
+            self.config.context_budget = int(self.config.large_context_budget)
+            changed.append(f"context_budget={self.config.context_budget}")
+        if int(self.config.system_prompt_budget) == 512:
+            self.config.system_prompt_budget = int(self.config.large_system_prompt_budget)
+            changed.append(f"system_prompt_budget={self.config.system_prompt_budget}")
+        if int(self.config.output_reserve) == 1024:
+            self.config.output_reserve = int(self.config.large_output_reserve)
+            changed.append(f"output_reserve={self.config.output_reserve}")
+        if int(self.config.codemap_budget) == 256:
+            self.config.codemap_budget = int(self.config.large_codemap_budget)
+            changed.append(f"codemap_budget={self.config.codemap_budget}")
+
+        if changed:
+            self.console.print(
+                "[dim]Context profile=large applied: " + ", ".join(changed) + "[/dim]"
+            )
+
+    def _prepend_codemap(
+        self,
+        context: ContextBlock,
+        codemap_prefix: str,
+        codemap_tokens: int,
+    ) -> ContextBlock:
+        if not codemap_prefix:
+            return context
+        combined_content = codemap_prefix.rstrip() + "\n\n" + context.content
+        combined_tokens = context.token_count + codemap_tokens
+        return ContextBlock(
+            content=combined_content,
+            sources=["yams-knowledge-graph"] + list(context.sources or []),
+            chunk_ids=["codemap"] + list(context.chunk_ids or []),
+            token_count=combined_tokens,
+            budget=self.config.context_budget,
+            utilization=combined_tokens / max(1, self.config.context_budget),
+            chunks_included=context.chunks_included + 1,
+            chunks_considered=context.chunks_considered,
+        )
+
+    def _compute_decomposer_controls(
+        self,
+        optimizer: RetrievalOptimizer,
+        prev_critique: Critique | None,
+    ) -> tuple[dict[str, float], set[QueryType]]:
+        scores = optimizer.get_query_type_scores()
+        type_bias: dict[str, float] = {
+            QueryType.SEMANTIC.value: 1.0,
+            QueryType.GREP.value: 1.0,
+            QueryType.GET.value: 1.0,
+            QueryType.GRAPH.value: 1.0,
+            QueryType.LIST.value: 1.0,
+        }
+        require_types: set[QueryType] = set()
+
+        semantic_score = float(scores.get("semantic", 0.5))
+        grep_score = float(scores.get("grep", 0.5))
+        get_score = float(scores.get("get", 0.5))
+
+        if semantic_score < 0.45:
+            type_bias[QueryType.SEMANTIC.value] *= 0.75
+            type_bias[QueryType.GREP.value] *= 1.25
+            type_bias[QueryType.GET.value] *= 1.15
+            require_types.add(QueryType.GREP)
+
+        if get_score < 0.35 and grep_score < 0.45:
+            # Keep at least one semantic probe when lexical lookups also struggle.
+            type_bias[QueryType.SEMANTIC.value] *= 1.1
+
+        if prev_critique and len(prev_critique.missing_info or []) >= 2:
+            type_bias[QueryType.GET.value] *= 1.2
+            require_types.add(QueryType.GET)
+
+        return type_bias, require_types
+
+    @staticmethod
+    def _extract_task_terms(task: str) -> list[str]:
+        stop = {
+            "what",
+            "how",
+            "does",
+            "with",
+            "from",
+            "that",
+            "this",
+            "into",
+            "over",
+            "when",
+            "where",
+            "which",
+            "using",
+            "used",
+            "list",
+            "focus",
+            "explain",
+            "describe",
+        }
+        terms: list[str] = []
+        for w in re.findall(r"[A-Za-z0-9_\-]+", task or ""):
+            t = w.lower()
+            if len(t) < 4 or t in stop:
+                continue
+            if t not in terms:
+                terms.append(t)
+            if len(terms) >= 12:
+                break
+        return terms
+
+    @staticmethod
+    def _query_terms(spec: QuerySpec) -> list[str]:
+        terms: list[str] = []
+        for w in re.findall(r"[A-Za-z0-9_\-]+", spec.query or ""):
+            if w.lower() == "path":
+                continue
+            if len(w) < 3:
+                continue
+            lw = w.lower()
+            if lw not in terms:
+                terms.append(lw)
+        return terms
+
+    @staticmethod
+    def _spec_has_path_hint(spec: QuerySpec) -> bool:
+        q = (spec.query or "").lower()
+        return "path:" in q or "/" in q
+
+    @staticmethod
+    def _is_test_source(src: str) -> bool:
+        s = (src or "").lower()
+        return "/tests/" in s or s.endswith("_test.cpp") or s.endswith("_test.py")
+
+    def _rerank_and_cap_chunks(
+        self,
+        *,
+        task: str,
+        spec: QuerySpec,
+        chunks: list[Any],
+    ) -> list[Any]:
+        if not chunks:
+            return []
+
+        task_l = (task or "").lower()
+        task_terms = self._extract_task_terms(task)
+        query_terms = self._query_terms(spec)
+        has_path_hint = self._spec_has_path_hint(spec)
+        mentions_test = "test" in task_l
+
+        rescored: list[Any] = []
+        for c in list(chunks):
+            score = float(getattr(c, "score", 0.0) or 0.0)
+            src_l = (getattr(c, "source", "") or "").lower()
+            text_l = (getattr(c, "content", "") or "").lower()
+
+            # Penalize obvious noisy paths unless task asks for tests.
+            if not mentions_test and self._is_test_source(src_l):
+                score *= 0.6
+
+            if "/docs/" in src_l and "doc" not in task_l:
+                score *= 0.85
+
+            # Reward source paths that overlap task terms; downweight otherwise.
+            if task_terms:
+                path_hits = sum(1 for t in task_terms if t in src_l)
+                if path_hits > 0:
+                    score *= 1.0 + min(0.2, 0.05 * path_hits)
+                elif spec.query_type == QueryType.GREP and not has_path_hint:
+                    score *= 0.82
+
+            # Reward chunks that mention query terms in content.
+            if query_terms:
+                qhits = sum(1 for t in query_terms if t in text_l)
+                if qhits > 0:
+                    score *= 1.0 + min(0.2, 0.05 * qhits)
+                elif spec.query_type == QueryType.GREP:
+                    score *= 0.9
+
+            c.score = max(0.0, min(1.0, score))
+            rescored.append(c)
+
+        rescored = [
+            c
+            for c in rescored
+            if float(getattr(c, "score", 0.0) or 0.0) >= float(self.config.min_chunk_score)
+        ]
+
+        rescored.sort(key=lambda c: float(getattr(c, "score", 0.0) or 0.0), reverse=True)
+
+        # Keep non-test files first when available.
+        if spec.query_type == QueryType.GREP and not mentions_test:
+            non_test = [c for c in rescored if not self._is_test_source(getattr(c, "source", ""))]
+            if non_test:
+                rescored = non_test
+
+        # Avoid over-concentrating on one file for broad grep.
+        if spec.query_type == QueryType.GREP and not has_path_hint:
+            per_source: dict[str, int] = {}
+            balanced: list[Any] = []
+            for c in rescored:
+                src = str(getattr(c, "source", "") or getattr(c, "chunk_id", ""))
+                n = per_source.get(src, 0)
+                if n >= 2:
+                    continue
+                per_source[src] = n + 1
+                balanced.append(c)
+            rescored = balanced
+
+        max_chunks = int(self.config.max_chunks_per_query)
+        if spec.query_type == QueryType.GREP:
+            max_chunks = min(max_chunks, 6)
+        elif spec.query_type == QueryType.GET:
+            max_chunks = min(max_chunks, 4)
+
+        return rescored[:max_chunks]
+
+    async def _execute_with_overflow_retry(
+        self,
+        *,
+        executor: ModelExecutor,
+        task: str,
+        query_results: list[YAMSQueryResult],
+        context: ContextBlock,
+        assembler: ContextAssembler,
+        codemap_prefix: str,
+        codemap_tokens: int,
+    ) -> tuple[ExecutionResult, ContextBlock, ContextAssembler, int]:
+        retries = 0
+        cur_context = context
+        cur_assembler = assembler
+        cur_max_tokens = int(self.config.executor_model.max_output_tokens)
+
+        while True:
+            exec_result = await executor.execute(
+                task=task,
+                context=cur_context,
+                max_tokens=cur_max_tokens,
+            )
+            err = (
+                (exec_result.raw_response or {}).get("error") if exec_result.raw_response else None
+            )
+            if err != "context_overflow":
+                return exec_result, cur_context, cur_assembler, retries
+
+            if retries >= int(self.config.max_context_overflow_retries):
+                return exec_result, cur_context, cur_assembler, retries
+
+            retries += 1
+            shrink = _clamp01(float(self.config.context_shrink_factor))
+            if shrink <= 0.0:
+                shrink = 0.7
+
+            next_budget = max(
+                int(self.config.min_context_budget),
+                int(cur_assembler.budget * shrink),
+            )
+            next_max_tokens = max(
+                int(self.config.min_output_tokens),
+                int(cur_max_tokens * shrink),
+            )
+
+            if next_budget >= cur_assembler.budget and next_max_tokens >= cur_max_tokens:
+                return exec_result, cur_context, cur_assembler, retries
+
+            cur_max_tokens = next_max_tokens
+            cur_assembler = ContextAssembler(
+                budget=next_budget,
+                model=self.config.executor_model.name,
+            )
+            rebuilt = cur_assembler.assemble(query_results, task=task)
+            cur_context = self._prepend_codemap(rebuilt, codemap_prefix, codemap_tokens)
+
     def _init_client(self, weights: dict[str, float]) -> YAMSClient:
         """Construct YAMSClient with best-effort config injection.
 
@@ -133,6 +434,19 @@ class DCSPipeline:
         critic_cfg = self.config.critic_model or self.config.executor_model
         base_weights = dict(self.config.search_weights or {})
 
+        # Runtime context-size check: requested vs actual (LM Studio).
+        req_exec, act_exec = self._reconcile_model_context_window(self.config.executor_model)
+        req_crit, act_crit = self._reconcile_model_context_window(critic_cfg)
+        self.console.print(
+            f"[dim]Context window executor: requested={req_exec} actual={act_exec}[/dim]"
+        )
+        if critic_cfg.name != self.config.executor_model.name or act_crit != act_exec:
+            self.console.print(
+                f"[dim]Context window critic: requested={req_crit} actual={act_crit}[/dim]"
+            )
+
+        self._apply_context_profile(int(act_exec or req_exec or 0))
+
         self.console.rule("DCS Pipeline")
         self.console.print(f"Task: {task}")
         self.console.print(
@@ -150,7 +464,9 @@ class DCSPipeline:
                 executor = ModelExecutor(self.config.executor_model)
                 decomposer = TaskDecomposer(self.config.executor_model)
                 planner = QueryPlanner(client)
-                assembler = ContextAssembler(budget=self.config.context_budget, model=self.config.executor_model.name)
+                assembler = ContextAssembler(
+                    budget=self.config.context_budget, model=self.config.executor_model.name
+                )
                 critic = SelfCritic(critic_cfg)
                 optimizer = RetrievalOptimizer(yams_client=client)
 
@@ -176,15 +492,33 @@ class DCSPipeline:
                     except Exception as e:
                         self.console.print(f"[dim]Codemap: skipped ({e})[/dim]")
 
-                # Adjust assembler budget to reserve room for codemap prefix.
+                # Adjust assembler budget to reserve room for codemap prefix and
+                # keep total prompt within the model context window.
                 effective_budget = int(self.config.context_budget)
+                model_budget = ContextAssembler.estimate_budget(
+                    self.config.executor_model.context_window,
+                    self.config.system_prompt_budget,
+                    self.config.output_reserve,
+                )
+                if model_budget > 0:
+                    effective_budget = min(effective_budget, model_budget)
+
                 if codemap_tokens > 0:
-                    effective_budget = max(64, effective_budget - codemap_tokens)
-                    assembler = ContextAssembler(budget=effective_budget, model=self.config.executor_model.name)
+                    effective_budget = max(0, effective_budget - codemap_tokens)
+
+                if effective_budget <= 0:
                     self.console.print(
-                        f"[dim]Assembler budget adjusted: {self.config.context_budget} "
-                        f"- {codemap_tokens} codemap = {effective_budget}[/dim]"
+                        "[dim]Assembler budget reduced to 0 (context window too small)[/dim]"
                     )
+                else:
+                    assembler = ContextAssembler(
+                        budget=effective_budget, model=self.config.executor_model.name
+                    )
+                    if effective_budget != self.config.context_budget or codemap_tokens > 0:
+                        self.console.print(
+                            f"[dim]Assembler budget adjusted: {self.config.context_budget} "
+                            f"(model={model_budget}) - {codemap_tokens} codemap = {effective_budget}[/dim]"
+                        )
 
                 for it in range(1, int(self.config.max_iterations) + 1):
                     iter_start = _now_ms()
@@ -197,12 +531,28 @@ class DCSPipeline:
                     stage_table.add_column("Details")
 
                     try:
+                        type_bias, require_types = self._compute_decomposer_controls(
+                            optimizer,
+                            prev_critique,
+                        )
+
                         # a) Decompose/refine
                         t0 = _now_ms()
                         if it == 1 or prev_critique is None:
-                            specs = await decomposer.decompose(task, max_queries=self.config.max_queries_per_iteration)
+                            specs = await decomposer.decompose(
+                                task,
+                                max_queries=self.config.max_queries_per_iteration,
+                                type_bias=type_bias,
+                                require_types=require_types,
+                            )
                         else:
-                            specs = await decomposer.refine(task, prev_critique, prev_specs)
+                            specs = await decomposer.refine(
+                                task,
+                                prev_critique,
+                                prev_specs,
+                                type_bias=type_bias,
+                                require_types=require_types,
+                            )
                         specs = list(specs or [])[: int(self.config.max_queries_per_iteration)]
                         record.specs = specs
                         stage_table.add_row(
@@ -217,10 +567,11 @@ class DCSPipeline:
 
                         # Enforce local caps/filters regardless of planner implementation.
                         for qr in query_results:
-                            chunks = list(qr.chunks or [])
-                            chunks = [c for c in chunks if float(getattr(c, "score", 0.0) or 0.0) >= float(self.config.min_chunk_score)]
-                            chunks.sort(key=lambda c: float(getattr(c, "score", 0.0) or 0.0), reverse=True)
-                            qr.chunks = chunks[: int(self.config.max_chunks_per_query)]
+                            qr.chunks = self._rerank_and_cap_chunks(
+                                task=task,
+                                spec=qr.spec,
+                                chunks=list(qr.chunks or []),
+                            )
 
                         record.query_results = query_results
                         stage_table.add_row(
@@ -232,25 +583,38 @@ class DCSPipeline:
                         # c) Assemble
                         t0 = _now_ms()
                         context = assembler.assemble(query_results, task=task)
+                        context = self._prepend_codemap(context, codemap_prefix, codemap_tokens)
 
-                        # Prepend codemap prefix to assembled context so the
-                        # model sees structural codebase awareness before the
-                        # task-specific retrieved chunks.
-                        if codemap_prefix:
-                            combined_content = codemap_prefix.rstrip() + "\n\n" + context.content
-                            combined_tokens = context.token_count + codemap_tokens
-                            context = ContextBlock(
-                                content=combined_content,
-                                sources=["yams-knowledge-graph"] + list(context.sources or []),
-                                chunk_ids=["codemap"] + list(context.chunk_ids or []),
-                                token_count=combined_tokens,
-                                budget=self.config.context_budget,  # report against full budget
-                                utilization=combined_tokens / max(1, self.config.context_budget),
-                                chunks_included=context.chunks_included + 1,
-                                chunks_considered=context.chunks_considered,
-                            )
+                        # Ensure prompt fits the actual LM Studio context length when available.
+                        if lmstudio_available():
+                            max_ctx = get_context_length(self.config.executor_model.name)
+                            if max_ctx:
+                                target = int(max_ctx * 0.9)
+                                for _ in range(3):
+                                    messages = executor._build_messages(
+                                        task=task, context=context, system_prompt=None
+                                    )
+                                    prompt_tokens = count_prompt_tokens(
+                                        self.config.executor_model.name, messages
+                                    )
+                                    if prompt_tokens is None or prompt_tokens <= target:
+                                        break
+                                    shrink = max(
+                                        64, int(assembler.budget * (target / max(1, prompt_tokens)))
+                                    )
+                                    if shrink >= assembler.budget:
+                                        break
+                                    assembler = ContextAssembler(
+                                        budget=shrink,
+                                        model=self.config.executor_model.name,
+                                    )
+                                    context = assembler.assemble(query_results, task=task)
+                                    context = self._prepend_codemap(
+                                        context,
+                                        codemap_prefix,
+                                        codemap_tokens,
+                                    )
 
-                        record.context = context
                         stage_table.add_row(
                             "assemble",
                             f"{_now_ms() - t0:.0f}",
@@ -259,17 +623,33 @@ class DCSPipeline:
 
                         # d) Execute
                         t0 = _now_ms()
-                        exec_result = await executor.execute(task=task, context=context)
+                        (
+                            exec_result,
+                            context,
+                            assembler,
+                            overflow_retries,
+                        ) = await self._execute_with_overflow_retry(
+                            executor=executor,
+                            task=task,
+                            query_results=query_results,
+                            context=context,
+                            assembler=assembler,
+                            codemap_prefix=codemap_prefix,
+                            codemap_tokens=codemap_tokens,
+                        )
                         record.result = exec_result
+                        record.context = context
                         stage_table.add_row(
                             "execute",
                             f"{_now_ms() - t0:.0f}",
-                            f"model={exec_result.model}",
+                            f"model={exec_result.model} retries={overflow_retries}",
                         )
 
                         # e) Critique
                         t0 = _now_ms()
-                        critique = await critic.critique(task=task, context=context, result=exec_result)
+                        critique = await critic.critique(
+                            task=task, context=context, result=exec_result
+                        )
                         record.critique = critique
                         stage_table.add_row(
                             "critique",
@@ -277,15 +657,58 @@ class DCSPipeline:
                             f"quality={critique.quality_score:.2f}",
                         )
 
+                        # e.1) Ground-truth-free faithfulness checks
+                        if bool(self.config.no_ground_truth_mode):
+                            t0 = _now_ms()
+                            faith = build_faithfulness_report(
+                                task=task,
+                                context=context,
+                                output=exec_result.output,
+                                min_overlap=float(self.config.claim_evidence_min_overlap),
+                                min_confidence=float(self.config.faithfulness_min_confidence),
+                                max_unsupported_ratio=float(
+                                    self.config.faithfulness_max_unsupported_ratio
+                                ),
+                                min_supported_claims=int(
+                                    self.config.faithfulness_min_supported_claims
+                                ),
+                                use_dspy=bool(self.config.use_dspy_faithfulness),
+                                dspy_model_config=critic_cfg,
+                            )
+                            record.faithfulness = faith
+
+                            # Blend confidence into quality so router/escalation can
+                            # treat weakly-grounded answers conservatively.
+                            critique.quality_score = min(
+                                float(critique.quality_score or 0.0),
+                                float(faith.confidence or 0.0),
+                            )
+
+                            if faith.should_abstain:
+                                critique.missing_info.append(
+                                    "Faithfulness guard: low grounded confidence; additional evidence required."
+                                )
+                                if it >= int(self.config.max_iterations):
+                                    exec_result.output = build_abstention_output(task, faith)
+                                    record.result = exec_result
+
+                            stage_table.add_row(
+                                "faithfulness",
+                                f"{_now_ms() - t0:.0f}",
+                                f"conf={faith.confidence:.2f} support={faith.supported_ratio:.2f}",
+                            )
+
                         # f) Optimize
                         t0 = _now_ms()
                         try:
-                            optimizer.record_feedback(query_results=query_results, critique=critique)
+                            optimizer.record_feedback(
+                                query_results=query_results, critique=critique
+                            )
                             adjusted = optimizer.get_adjusted_weights() or {}
                             weights = _merge_weights(base_weights, adjusted)
                             # Best-effort: update client weights if it exposes an attribute.
                             if hasattr(client, "search_weights"):
-                                setattr(client, "search_weights", weights)
+                                client.search_weights = weights
                         except Exception as e:
                             stage_table.add_row(
                                 "optimize",
@@ -307,7 +730,10 @@ class DCSPipeline:
                         prev_specs = specs
                         prev_critique = critique
 
-                        if self._converged(prev_quality, critique):
+                        faith_abstain = bool(
+                            record.faithfulness is not None and record.faithfulness.should_abstain
+                        )
+                        if self._converged(prev_quality, critique) and not faith_abstain:
                             result.converged = True
                             break
                         prev_quality = float(critique.quality_score or 0.0)
@@ -337,14 +763,18 @@ class DCSPipeline:
         if result.iterations:
             # Prefer iteration with highest critique quality_score.
             scored = [
-                it for it in result.iterations
-                if it.critique is not None and it.result is not None
+                it for it in result.iterations if it.critique is not None and it.result is not None
             ]
             if scored:
-                best_iter = max(scored, key=lambda it: (
-                    float((it.critique.quality_score if it.critique else 0.0) or 0.0),
-                    int(it.context.token_count if it.context else 0),  # tiebreak: more context = better
-                ))
+                best_iter = max(
+                    scored,
+                    key=lambda it: (
+                        float((it.critique.quality_score if it.critique else 0.0) or 0.0),
+                        int(
+                            it.context.token_count if it.context else 0
+                        ),  # tiebreak: more context = better
+                    ),
+                )
             else:
                 # No critiques succeeded — pick iteration with most context tokens.
                 with_result = [it for it in result.iterations if it.result is not None]
@@ -356,6 +786,9 @@ class DCSPipeline:
 
         if best_iter is not None and best_iter.result is not None:
             result.final_output = best_iter.result.output
+            if best_iter.faithfulness is not None and best_iter.faithfulness.should_abstain:
+                result.final_output = build_abstention_output(task, best_iter.faithfulness)
+            result.best_iteration = int(best_iter.iteration)
         result.total_latency_ms = _now_ms() - start_total
 
         final_quality = 0.0
@@ -407,6 +840,7 @@ class DCSPipeline:
         result.final_output = record.result.output if record.result else ""
         result.total_latency_ms = _now_ms() - start_total
         result.converged = True
+        result.best_iteration = 1
         return result
 
 
@@ -422,6 +856,7 @@ def pipeline_result_to_dict(res: PipelineResult) -> dict[str, Any]:
             "final_output": res.final_output,
             "total_latency_ms": res.total_latency_ms,
             "converged": res.converged,
+            "best_iteration": int(res.best_iteration or 0),
             "iterations": [],
         }
         for it in res.iterations:
@@ -472,6 +907,18 @@ def pipeline_result_to_dict(res: PipelineResult) -> dict[str, Any]:
                         "missing_info": list(it.critique.missing_info or []),
                         "irrelevant_chunks": list(it.critique.irrelevant_chunks or []),
                         "suggested_queries": list(it.critique.suggested_queries or []),
+                    },
+                    "faithfulness": None
+                    if it.faithfulness is None
+                    else {
+                        "confidence": it.faithfulness.confidence,
+                        "supported_ratio": it.faithfulness.supported_ratio,
+                        "evidence_coverage_ratio": it.faithfulness.evidence_coverage_ratio,
+                        "should_abstain": it.faithfulness.should_abstain,
+                        "unsupported_claim_ids": list(it.faithfulness.unsupported_claim_ids),
+                        "num_claims": len(it.faithfulness.claims or []),
+                        "num_evidence": len(it.faithfulness.evidence or []),
+                        "rationale": it.faithfulness.rationale,
                     },
                 }
             )

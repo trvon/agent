@@ -5,6 +5,19 @@ description: >
   and a one-line description of what it does. Focus on the tool names
   registered in mcp_server.cpp.
 ground_truth:
+  files:
+    - src/mcp/mcp_server.cpp
+    - include/yams/mcp/tool_registry.h
+  symbols:
+    - registerTool
+    - registerRawTool
+    - search
+    - grep
+    - add
+    - get
+    - graph
+    - session_start
+    - update_metadata
   patterns:
     - search
     - grep

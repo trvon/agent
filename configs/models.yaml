@@ -39,6 +39,28 @@ models:
     temperature: 0.7
     role: critic
 
+  qwen35-35b-a3b:
+    backend: lmstudio
+    name: "qwen3.5-35b-a3b_moe"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: critic
+    request_timeout_s: 300
+    max_retries: 3
+    retry_backoff_s: 3.0
+
+  qwen35-35b-a3b-mlx:
+    backend: lmstudio
+    name: "mlx-community/qwen3.5-35b-a3b"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: critic
+    request_timeout_s: 300
+    max_retries: 3
+    retry_backoff_s: 3.0
+
   devstral:
     backend: lmstudio
     name: "mistralai/devstral-small-2-2512"
@@ -54,6 +76,20 @@ models:
     max_output_tokens: 2048
     temperature: 0.7
     role: critic
+    request_timeout_s: 240
+    max_retries: 2
+    retry_backoff_s: 2.0
+
+  gpt-oss-20b:
+    backend: lmstudio
+    name: "openai/gpt-oss-20b"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: executor
+    request_timeout_s: 180
+    max_retries: 2
+    retry_backoff_s: 2.0
 
   # --- Large models (ceiling reference) ---
   gpt-oss-120b:
@@ -66,6 +102,6 @@ models:
 
 # Default experiment configuration
 defaults:
-  executor: qwen3-4b
-  critic: devstral
-  baseline: gpt-oss-120b
+  executor: gpt-oss-20b
+  critic: qwen35-35b-a3b
+  baseline: gpt-oss-20b

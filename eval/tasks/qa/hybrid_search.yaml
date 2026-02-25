@@ -5,6 +5,17 @@ description: >
   different search backends that are fused together and why this
   approach is used instead of pure semantic or keyword search.
 ground_truth:
+  files:
+    - src/search/search_engine.cpp
+    - include/yams/search/search_engine.h
+    - src/metadata/knowledge_graph_store_sqlite.cpp
+  symbols:
+    - hybrid
+    - fusion
+    - FTS5
+    - semantic
+    - vector
+    - knowledge graph
   patterns:
     - re:hybrid
     - re:FTS5|full.text|keyword

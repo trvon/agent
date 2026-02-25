@@ -85,21 +85,8 @@ class RetrievalOptimizer:
             if qtype_str not in ("semantic", "grep", "graph", "get", "list"):
                 continue
 
-            chunks = getattr(qr, "chunks", None) or []
-            if not chunks:
-                # No results is a weak failure signal.
-                by_qtype.setdefault(qtype_str, []).append(0.0)
-                continue
-
-            useful = 0
-            total = 0
-            for ch in chunks:
-                cid = getattr(ch, "chunk_id", "") or ""
-                total += 1
-                if cid and cid in irrelevant:
-                    continue
-                useful += 1
-            by_qtype.setdefault(qtype_str, []).append(useful / max(1, total))
+            score = self._score_query_result(qr, irrelevant)
+            by_qtype.setdefault(qtype_str, []).append(score)
 
         with self._lock:
             qsucc: dict[str, list[float]] = self.weights.get("query_type_success", {})
@@ -129,6 +116,36 @@ class RetrievalOptimizer:
             self.weights["fusion_weights"] = _normalize_weights(fw)
 
         self._store_feedback_in_yams(query_results=query_results, critique=critique)
+
+    def _score_query_result(self, qr: YAMSQueryResult, irrelevant: set[str]) -> float:
+        chunks = getattr(qr, "chunks", None) or []
+        if not chunks:
+            return 0.0
+
+        useful = 0
+        total = 0
+        enriched = 0
+        for ch in chunks:
+            cid = getattr(ch, "chunk_id", "") or ""
+            total += 1
+            if cid and cid in irrelevant:
+                continue
+            useful += 1
+            if getattr(ch, "metadata", None) and ch.metadata.get("enriched"):
+                enriched += 1
+
+        base = useful / max(1, total)
+
+        # Penalize path-only grep results (enriched=False)
+        if total > 0 and enriched == 0:
+            return max(0.05, base * 0.3)
+
+        # Reward enriched content modestly
+        if enriched > 0:
+            bonus = min(0.2, enriched / max(1, total) * 0.2)
+            return _clamp01(base + bonus)
+
+        return _clamp01(base)
 
     def get_adjusted_weights(self) -> dict[str, float]:
         with self._lock:
@@ -203,7 +220,8 @@ class RetrievalOptimizer:
             data = {
                 "fusion_weights": dict(self.weights.get("fusion_weights", {})),
                 "query_type_success": {
-                    k: list(v) for k, v in (self.weights.get("query_type_success", {}) or {}).items()
+                    k: list(v)
+                    for k, v in (self.weights.get("query_type_success", {}) or {}).items()
                 },
             }
 
@@ -236,7 +254,7 @@ class RetrievalOptimizer:
             return
 
         try:
-            with open(load_path, "r", encoding="utf-8") as f:
+            with open(load_path, encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
         except Exception:
             logger.warning("Failed to load retrieval weights from %s", load_path, exc_info=True)
@@ -266,7 +284,9 @@ class RetrievalOptimizer:
 
         logger.debug("Loaded retrieval weights from %s", load_path)
 
-    def _store_feedback_in_yams(self, query_results: list[YAMSQueryResult], critique: Critique) -> None:
+    def _store_feedback_in_yams(
+        self, query_results: list[YAMSQueryResult], critique: Critique
+    ) -> None:
         if self.yams_client is None:
             return
         add = getattr(self.yams_client, "add", None)
@@ -275,6 +295,14 @@ class RetrievalOptimizer:
 
         # Best-effort, generic payload; avoid depending on a specific YAMSClient signature.
         try:
+            query_types: list[str] = []
+            for qr in query_results:
+                qt = getattr(getattr(qr, "spec", None), "query_type", "")
+                if isinstance(qt, QueryType):
+                    query_types.append(qt.value)
+                else:
+                    query_types.append(str(qt or ""))
+
             payload = {
                 "critique": {
                     "context_utilization": float(critique.context_utilization),
@@ -284,12 +312,7 @@ class RetrievalOptimizer:
                     "suggested_queries": list(critique.suggested_queries or []),
                     "reasoning": critique.reasoning,
                 },
-                "query_types": [
-                    (getattr(getattr(qr, "spec", None), "query_type", "") or "").value
-                    if isinstance(getattr(getattr(qr, "spec", None), "query_type", None), QueryType)
-                    else str(getattr(getattr(qr, "spec", None), "query_type", ""))
-                    for qr in query_results
-                ],
+                "query_types": query_types,
             }
             add(
                 content=yaml.safe_dump(payload, sort_keys=True),

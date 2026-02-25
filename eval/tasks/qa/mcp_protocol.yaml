@@ -5,6 +5,16 @@ description: >
   How is the server started, what transport does it use, and how does
   a client communicate with it?
 ground_truth:
+  files:
+    - src/mcp/stdio_transport.cpp
+    - src/mcp/mcp_server.cpp
+    - src/cli/commands/serve_command.cpp
+  symbols:
+    - MCP
+    - NDJSON
+    - JSON-RPC
+    - yams serve
+    - tools/call
   patterns:
     - re:MCP|Model Context Protocol
     - re:stdio|NDJSON|JSON.RPC

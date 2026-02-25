@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +16,6 @@ from dcs.types import (
     PipelineResult,
     TaskType,
 )
-
 from eval.metrics import evaluate_task
 
 
@@ -99,6 +96,10 @@ class EvalRunner:
             return metrics["exact_match"] >= 1.0
         if "contains_pattern" in metrics:
             return metrics["contains_pattern"] >= 1.0
+        if "faithfulness_confidence" in metrics:
+            fthr = float(ev.get("faithfulness_threshold") or 0.6)
+            abstain = float(metrics.get("faithfulness_should_abstain") or 0.0)
+            return float(metrics.get("faithfulness_confidence") or 0.0) >= fthr and abstain < 0.5
         if "quality_score" in metrics:
             return metrics["quality_score"] >= float(ev.get("quality_threshold") or 0.7)
         return False
@@ -114,7 +115,9 @@ class EvalRunner:
             passed = self._decide_pass(task, metrics)
             return EvalResult(task_id=task.id, pipeline_result=pr, metrics=metrics, passed=passed)
         except Exception as e:
-            return EvalResult(task_id=task.id, pipeline_result=None, metrics={}, passed=False, error=str(e))
+            return EvalResult(
+                task_id=task.id, pipeline_result=None, metrics={}, passed=False, error=str(e)
+            )
 
     async def run_suite(self, tasks: list[EvalTask], scaffolded: bool = True) -> list[EvalResult]:
         results: list[EvalResult] = []
@@ -123,7 +126,9 @@ class EvalRunner:
             results.append(r)
         return results
 
-    async def run_comparison(self, tasks: list[EvalTask]) -> tuple[ComparisonResult, ComparisonResult]:
+    async def run_comparison(
+        self, tasks: list[EvalTask]
+    ) -> tuple[ComparisonResult, ComparisonResult]:
         exec_model = self.config.executor_model.name
         a = ComparisonResult(config_name="default", model=exec_model, scaffolded=True)
         b = ComparisonResult(config_name="default", model=exec_model, scaffolded=False)
@@ -144,11 +149,15 @@ class EvalRunner:
             q = r.metrics.get("quality_score", 0.0)
             lat = r.metrics.get("total_latency_ms", 0.0)
             iters = r.metrics.get("iterations", 0.0)
-            tbl.add_row(r.task_id, "yes" if r.passed else "no", f"{q:.2f}", f"{lat:.0f}", f"{iters:.0f}")
+            tbl.add_row(
+                r.task_id, "yes" if r.passed else "no", f"{q:.2f}", f"{lat:.0f}", f"{iters:.0f}"
+            )
         self.console.print(tbl)
 
 
-async def run_comparison_report(runner: EvalRunner, tasks: list[EvalTask]) -> tuple[ComparisonResult, ComparisonResult]:
+async def run_comparison_report(
+    runner: EvalRunner, tasks: list[EvalTask]
+) -> tuple[ComparisonResult, ComparisonResult]:
     a, b = await runner.run_comparison(tasks)
     runner.print_results(a.tasks, "Scaffolded")
     runner.print_results(b.tasks, "Vanilla")

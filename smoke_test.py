@@ -12,7 +12,7 @@ import asyncio
 import logging
 import sys
 
-from dcs.pipeline import DCSPipeline, pipeline_result_to_dict
+from dcs.pipeline import DCSPipeline
 from dcs.types import ModelConfig, PipelineConfig
 
 logging.basicConfig(

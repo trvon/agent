@@ -5,6 +5,16 @@ description: >
   what search types does it support, and how does hybrid search combine
   results from different backends?
 ground_truth:
+  files:
+    - src/search/search_engine.cpp
+    - include/yams/search/search_engine.h
+    - src/search/search_engine_builder.cpp
+  symbols:
+    - SearchEngine
+    - hybrid
+    - fusion
+    - FTS5
+    - vector
   patterns:
     - SearchEngine
     - re:hybrid|fusion

@@ -1,0 +1,460 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from pathlib import Path
+from typing import Any
+
+import yaml
+from rich.console import Console
+from rich.table import Table
+
+from dcs.lmstudio_context import get_context_length, preload_model
+from dcs.pipeline import DCSPipeline
+from dcs.router import RoutingPolicy, TieredRouter
+from dcs.types import EvalResult, EvalTask, ModelConfig, PipelineConfig, PipelineResult, TaskType
+from eval.metrics import evaluate_task
+from eval.runner import EvalRunner
+
+
+def _load_models_config(path: Path) -> dict[str, Any]:
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"Invalid models config: {path}")
+    return raw
+
+
+def _build_model_config(models_cfg: dict[str, Any], key: str) -> ModelConfig:
+    models = models_cfg.get("models") or {}
+    backends = models_cfg.get("backends") or {}
+    if key not in models:
+        raise KeyError(f"Unknown model key: {key}")
+
+    spec = models[key] or {}
+    backend = backends.get(spec.get("backend"), {})
+
+    name = str(spec.get("name", ""))
+    suffix = spec.get("system_suffix") or ""
+    if not suffix and "thinking" in name:
+        suffix = "/no_think"
+
+    return ModelConfig(
+        name=name,
+        base_url=str(backend.get("base_url", "http://localhost:1234/v1")),
+        api_key=str(backend.get("api_key", "lm-studio")),
+        context_window=int(spec.get("context_window", 8192)),
+        max_output_tokens=int(spec.get("max_output_tokens", 2048)),
+        temperature=float(spec.get("temperature", 0.7)),
+        system_suffix=str(suffix),
+        request_timeout_s=float(spec.get("request_timeout_s", 120.0)),
+        max_retries=int(spec.get("max_retries", 2)),
+        retry_backoff_s=float(spec.get("retry_backoff_s", 2.0)),
+    )
+
+
+def _collect_sources(pr: PipelineResult | None) -> list[str]:
+    if not pr:
+        return []
+    sources: set[str] = set()
+    for it in pr.iterations:
+        if it.context:
+            sources.update([s for s in it.context.sources if s])
+        for qr in it.query_results:
+            for chunk in qr.chunks:
+                if chunk.source:
+                    sources.add(chunk.source)
+    return sorted(sources)
+
+
+def _filter_by_tags(tasks: list[EvalTask], tags: set[str]) -> list[EvalTask]:
+    if not tags:
+        return tasks
+    out: list[EvalTask] = []
+    for t in tasks:
+        if tags.intersection(set(t.tags)):
+            out.append(t)
+    return out
+
+
+def _task_type_from_str(raw: str | None) -> TaskType | None:
+    if not raw:
+        return None
+    s = raw.strip().lower()
+    for t in TaskType:
+        if t.value == s:
+            return t
+    return None
+
+
+def _preload_configs(
+    console: Console,
+    model_cfgs: list[ModelConfig],
+    *,
+    retries: int,
+    retry_backoff_s: float,
+) -> None:
+    seen: set[tuple[str, str, str]] = set()
+    for cfg in model_cfgs:
+        key = (cfg.name, cfg.base_url, cfg.api_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        requested_ctx = int(cfg.context_window)
+        ok = preload_model(
+            cfg.name,
+            base_url=cfg.base_url,
+            api_key=cfg.api_key,
+            context_length=requested_ctx,
+            keep_model_in_memory=True,
+            retries=retries,
+            retry_backoff_s=retry_backoff_s,
+            ready_timeout_s=max(90.0, float(retries) * max(1.0, float(retry_backoff_s)) * 10.0),
+            ready_poll_s=max(1.0, float(retry_backoff_s)),
+        )
+        actual_ctx = get_context_length(cfg.name) or int(cfg.context_window)
+        try:
+            cfg.context_window = int(actual_ctx)
+        except Exception:
+            pass
+
+        status = "ok" if ok else "failed"
+        console.print(
+            "[dim]Preload "
+            f"{status}: {cfg.name} (requested_ctx={requested_ctx} actual_ctx={int(actual_ctx)})"
+            "[/dim]"
+        )
+
+
+async def _run_suite(
+    config: PipelineConfig,
+    tasks: list[EvalTask],
+    *,
+    checkpoint: dict[str, list[dict[str, Any]]] | None = None,
+    checkpoint_key: str | None = None,
+    checkpoint_path: Path | None = None,
+    fallback_configs: list[PipelineConfig] | None = None,
+    fallback_threshold: float | None = None,
+) -> list[EvalResult]:
+    runner = EvalRunner(config, task_dir=".")
+    results: list[EvalResult] = []
+    for task in tasks:
+        try:
+            if fallback_configs:
+                threshold = (
+                    float(fallback_threshold)
+                    if fallback_threshold is not None
+                    else float(config.quality_threshold)
+                )
+                router = TieredRouter(
+                    base_config=config,
+                    fallback_configs=fallback_configs,
+                    policy=RoutingPolicy(
+                        quality_threshold=threshold,
+                        min_sources=1,
+                        require_non_error_output=True,
+                        preload_tier_models=True,
+                        preload_retries=2,
+                        preload_retry_backoff_s=2.0,
+                    ),
+                )
+                routed = await router.run(task.description)
+                pr = routed.selected_result
+                selected_tier = routed.selected_tier
+                escalated = 1.0 if routed.escalated else 0.0
+            else:
+                pipe = DCSPipeline(config)
+                pr = await pipe.run(task.description)
+                selected_tier = 0
+                escalated = 0.0
+
+            metrics = evaluate_task(task, pr)
+            sources = _collect_sources(pr)
+            metrics["source_count"] = float(len(sources))
+            metrics["escalated"] = escalated
+            metrics["selected_tier"] = float(selected_tier)
+            passed = runner._decide_pass(task, metrics)
+            result = EvalResult(task_id=task.id, pipeline_result=pr, metrics=metrics, passed=passed)
+
+            results.append(result)
+        except Exception as e:
+            results.append(
+                EvalResult(
+                    task_id=task.id, pipeline_result=None, metrics={}, passed=False, error=str(e)
+                )
+            )
+
+        if checkpoint is not None and checkpoint_key and checkpoint_path:
+            payload = _serialize_results(results)
+            existing = checkpoint.get(checkpoint_key, [])
+            existing_ids = {str(x.get("task_id")) for x in existing}
+            for item in payload:
+                if str(item.get("task_id")) not in existing_ids:
+                    existing.append(item)
+                    existing_ids.add(str(item.get("task_id")))
+            checkpoint[checkpoint_key] = existing
+            _write_checkpoint(checkpoint_path, checkpoint)
+    return results
+
+
+def _render_table(console: Console, title: str, results: list[EvalResult]) -> None:
+    tbl = Table(title=title)
+    tbl.add_column("Task")
+    tbl.add_column("Pass", justify="center")
+    tbl.add_column("Quality", justify="right")
+    tbl.add_column("Sources", justify="right")
+    tbl.add_column("Latency ms", justify="right")
+    tbl.add_column("Iters", justify="right")
+
+    for r in results:
+        q = r.metrics.get("quality_score", 0.0)
+        lat = r.metrics.get("total_latency_ms", 0.0)
+        iters = r.metrics.get("iterations", 0.0)
+        sources = r.metrics.get("source_count", 0.0)
+        tbl.add_row(
+            r.task_id,
+            "yes" if r.passed else "no",
+            f"{q:.2f}",
+            f"{sources:.0f}",
+            f"{lat:.0f}",
+            f"{iters:.0f}",
+        )
+    console.print(tbl)
+
+
+def _serialize_results(results: list[EvalResult]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in results:
+        payload: dict[str, Any] = {
+            "task_id": r.task_id,
+            "passed": r.passed,
+            "metrics": r.metrics,
+            "error": r.error,
+        }
+        if r.pipeline_result:
+            payload["pipeline"] = {
+                "task": r.pipeline_result.task,
+                "iterations": r.pipeline_result.num_iterations,
+                "converged": r.pipeline_result.converged,
+                "total_latency_ms": r.pipeline_result.total_latency_ms,
+            }
+            payload["sources"] = _collect_sources(r.pipeline_result)
+        out.append(payload)
+    return out
+
+
+def _load_checkpoint(path: Path) -> dict[str, list[dict[str, Any]]]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for key, val in raw.items():
+        if isinstance(val, list):
+            out[key] = [v for v in val if isinstance(v, dict)]
+    return out
+
+
+def _write_checkpoint(path: Path, payload: dict[str, list[dict[str, Any]]]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _result_from_dict(d: dict[str, Any]) -> EvalResult:
+    return EvalResult(
+        task_id=str(d.get("task_id", "")),
+        pipeline_result=None,
+        metrics=d.get("metrics") or {},
+        passed=bool(d.get("passed", False)),
+        error=d.get("error"),
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run coverage benchmark suite over eval tasks")
+    parser.add_argument("--task-dir", default="eval/tasks", help="Task directory")
+    parser.add_argument("--task-type", default=None, help="Task type filter (qa|coding)")
+    parser.add_argument("--tags", default="", help="Comma-separated tag filter")
+    parser.add_argument("--models", default="", help="Comma-separated executor model keys")
+    parser.add_argument("--critic", default=None, help="Critic model key (or 'same')")
+    parser.add_argument("--context-budget", type=int, default=2048)
+    parser.add_argument("--max-iterations", type=int, default=3)
+    parser.add_argument("--quality-threshold", type=float, default=0.7)
+    parser.add_argument("--convergence-delta", type=float, default=0.05)
+    parser.add_argument(
+        "--context-profile",
+        choices=["auto", "standard", "large"],
+        default="auto",
+        help="Context budget profile selection",
+    )
+    parser.add_argument("--yams-cwd", default="/Users/trevon/work/tools/yams")
+    parser.add_argument(
+        "--ground-truth-mode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable/disable ground-truth-free faithfulness policy",
+    )
+    parser.add_argument(
+        "--dspy-faithfulness",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable/disable DSPy-first structured faithfulness extraction",
+    )
+    parser.add_argument("--models-config", default="configs/models.yaml")
+    parser.add_argument("--out", default=None, help="Write JSON results to path")
+    parser.add_argument("--checkpoint", default=None, help="Checkpoint JSON path")
+    parser.add_argument("--batch-size", type=int, default=0, help="Run at most N pending tasks")
+    parser.add_argument(
+        "--fallback-models", default="", help="Comma-separated fallback executor keys"
+    )
+    parser.add_argument("--fallback-critic", default=None, help="Critic model key for fallbacks")
+    parser.add_argument(
+        "--fallback-threshold",
+        type=float,
+        default=None,
+        help="Quality threshold to trigger fallback",
+    )
+    parser.add_argument(
+        "--preload-models",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Preload/pin executor and fallback models before each suite",
+    )
+    parser.add_argument(
+        "--preload-retries",
+        type=int,
+        default=3,
+        help="Retries for model preload warmup",
+    )
+    parser.add_argument(
+        "--preload-retry-backoff-s",
+        type=float,
+        default=2.0,
+        help="Backoff seconds between preload retries",
+    )
+    args = parser.parse_args()
+
+    console = Console()
+    models_cfg = _load_models_config(Path(args.models_config))
+    defaults = models_cfg.get("defaults") or {}
+
+    executors = [m for m in args.models.split(",") if m.strip()]
+    if not executors:
+        executors = [defaults.get("executor", "qwen3-4b")]
+
+    critic_key = args.critic or defaults.get("critic", "devstral")
+    fallback_keys = [m for m in args.fallback_models.split(",") if m.strip()]
+    fallback_critic_key = args.fallback_critic or critic_key
+
+    runner = EvalRunner(PipelineConfig(), task_dir=args.task_dir)
+    tasks = runner.load_tasks(args.task_dir, task_type=_task_type_from_str(args.task_type))
+    tags = {t.strip() for t in args.tags.split(",") if t.strip()}
+    tasks = _filter_by_tags(tasks, tags)
+
+    if not tasks:
+        console.print("No tasks found for selection")
+        return 1
+
+    checkpoint_path = Path(args.checkpoint) if args.checkpoint else None
+    checkpoint_data = _load_checkpoint(checkpoint_path) if checkpoint_path else {}
+
+    all_results: dict[str, list[EvalResult]] = {}
+
+    for exec_key in executors:
+        executor_cfg = _build_model_config(models_cfg, exec_key)
+        if critic_key == "same":
+            critic_cfg = executor_cfg
+        else:
+            critic_cfg = _build_model_config(models_cfg, critic_key)
+
+        config = PipelineConfig(
+            executor_model=executor_cfg,
+            critic_model=critic_cfg,
+            context_budget=args.context_budget,
+            max_iterations=args.max_iterations,
+            quality_threshold=args.quality_threshold,
+            convergence_delta=args.convergence_delta,
+            context_profile=str(args.context_profile),
+            no_ground_truth_mode=bool(args.ground_truth_mode),
+            use_dspy_faithfulness=bool(args.dspy_faithfulness),
+            yams_cwd=args.yams_cwd,
+        )
+
+        fallback_configs: list[PipelineConfig] = []
+        if fallback_keys:
+            for fb_key in fallback_keys:
+                fb_exec = _build_model_config(models_cfg, fb_key)
+                fb_crit = (
+                    fb_exec
+                    if fallback_critic_key == "same"
+                    else _build_model_config(models_cfg, fallback_critic_key)
+                )
+                fallback_configs.append(
+                    PipelineConfig(
+                        executor_model=fb_exec,
+                        critic_model=fb_crit,
+                        context_budget=args.context_budget,
+                        max_iterations=args.max_iterations,
+                        quality_threshold=args.quality_threshold,
+                        convergence_delta=args.convergence_delta,
+                        context_profile=str(args.context_profile),
+                        no_ground_truth_mode=bool(args.ground_truth_mode),
+                        use_dspy_faithfulness=bool(args.dspy_faithfulness),
+                        yams_cwd=args.yams_cwd,
+                    )
+                )
+
+        if args.preload_models:
+            preload_list = [config.executor_model]
+            if config.critic_model:
+                preload_list.append(config.critic_model)
+            for fb in fallback_configs:
+                preload_list.append(fb.executor_model)
+                if fb.critic_model:
+                    preload_list.append(fb.critic_model)
+            _preload_configs(
+                console,
+                preload_list,
+                retries=args.preload_retries,
+                retry_backoff_s=args.preload_retry_backoff_s,
+            )
+
+        console.print(f"\n=== Running {exec_key} (critic={critic_key}) ===")
+
+        existing = checkpoint_data.get(exec_key, [])
+        done_ids = {str(x.get("task_id")) for x in existing}
+        pending = [t for t in tasks if t.id not in done_ids]
+        if args.batch_size and args.batch_size > 0:
+            pending = pending[: args.batch_size]
+
+        results = asyncio.run(
+            _run_suite(
+                config,
+                pending,
+                checkpoint=checkpoint_data,
+                checkpoint_key=exec_key,
+                checkpoint_path=checkpoint_path,
+                fallback_configs=fallback_configs,
+                fallback_threshold=args.fallback_threshold,
+            )
+        )
+
+        new_payload = _serialize_results(results)
+        new_ids = {r.task_id for r in results}
+        combined = [*new_payload, *[x for x in existing if str(x.get("task_id")) not in new_ids]]
+        all_results[exec_key] = [_result_from_dict(x) for x in combined if isinstance(x, dict)]
+        _render_table(console, f"Results: {exec_key}", all_results[exec_key])
+
+    if args.out:
+        payload = {k: _serialize_results(v) for k, v in all_results.items()}
+        Path(args.out).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        console.print(f"Wrote results to {args.out}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

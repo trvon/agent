@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # Query / Decomposition types
 # ---------------------------------------------------------------------------
@@ -113,6 +112,46 @@ class Critique:
 
 
 # ---------------------------------------------------------------------------
+# No-ground-truth faithfulness types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EvidenceItem:
+    """Deterministic evidence extracted from assembled context."""
+
+    evidence_id: str
+    source: str
+    snippet: str
+    chunk_id: str = ""
+
+
+@dataclass
+class ClaimItem:
+    """A normalized claim extracted from model output."""
+
+    claim_id: str
+    text: str
+    evidence_ids: list[str] = field(default_factory=list)
+    supported: bool = False
+    confidence: float = 0.0
+
+
+@dataclass
+class FaithfulnessReport:
+    """Ground-truth-free faithfulness checks for a generated answer."""
+
+    claims: list[ClaimItem] = field(default_factory=list)
+    evidence: list[EvidenceItem] = field(default_factory=list)
+    unsupported_claim_ids: list[str] = field(default_factory=list)
+    supported_ratio: float = 0.0
+    evidence_coverage_ratio: float = 0.0
+    confidence: float = 0.0
+    should_abstain: bool = False
+    rationale: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Pipeline types
 # ---------------------------------------------------------------------------
 
@@ -139,6 +178,7 @@ class IterationRecord:
     context: ContextBlock | None = None
     result: ExecutionResult | None = None
     critique: Critique | None = None
+    faithfulness: FaithfulnessReport | None = None
     latency_ms: float = 0.0
 
 
@@ -151,6 +191,7 @@ class PipelineResult:
     final_output: str = ""
     total_latency_ms: float = 0.0
     converged: bool = False
+    best_iteration: int = 0
 
     @property
     def num_iterations(self) -> int:
@@ -181,6 +222,10 @@ class ModelConfig:
     # Optional suffix appended to system prompts. Use "/no_think" for qwen3
     # thinking models to disable chain-of-thought and save output tokens.
     system_suffix: str = ""
+    # Execution controls
+    request_timeout_s: float = 120.0
+    max_retries: int = 2
+    retry_backoff_s: float = 2.0
 
 
 @dataclass
@@ -198,6 +243,21 @@ class PipelineConfig:
     system_prompt_budget: int = 512  # tokens for system prompt
     output_reserve: int = 1024  # tokens reserved for model output
     codemap_budget: int = 256  # tokens reserved for structural codemap prefix
+    min_context_budget: int = 128  # lower bound for overflow retries
+    min_output_tokens: int = 256  # lower bound for overflow retries
+    context_shrink_factor: float = 0.7  # shrink multiplier on overflow retry
+    max_context_overflow_retries: int = 2
+
+    # Context profile behavior
+    # - auto: apply large profile when detected context window >= large_context_threshold
+    # - standard: keep configured defaults
+    # - large: force large profile
+    context_profile: str = "auto"
+    large_context_threshold: int = 12288
+    large_context_budget: int = 4096
+    large_system_prompt_budget: int = 768
+    large_output_reserve: int = 1536
+    large_codemap_budget: int = 512
 
     # Retrieval settings
     max_queries_per_iteration: int = 5
@@ -208,6 +268,14 @@ class PipelineConfig:
     max_iterations: int = 3
     quality_threshold: float = 0.7  # stop if critique quality >= this
     convergence_delta: float = 0.05  # stop if quality improvement < this
+
+    # Ground-truth-free faithfulness mode
+    no_ground_truth_mode: bool = True
+    use_dspy_faithfulness: bool = True
+    claim_evidence_min_overlap: float = 0.12
+    faithfulness_min_confidence: float = 0.60
+    faithfulness_max_unsupported_ratio: float = 0.40
+    faithfulness_min_supported_claims: int = 1
 
     # YAMS settings
     yams_binary: str = "yams"

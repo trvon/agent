@@ -5,6 +5,16 @@ description: >
   store, how are relationships represented, and how is it used
   during search?
 ground_truth:
+  files:
+    - src/metadata/knowledge_graph_store_sqlite.cpp
+    - include/yams/metadata/knowledge_graph_store.h
+    - src/search/search_engine.cpp
+  symbols:
+    - KnowledgeGraphStore
+    - node
+    - edge
+    - relation
+    - travers
   patterns:
     - re:knowledge.graph|KG
     - re:node|edge|relation

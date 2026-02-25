@@ -94,8 +94,13 @@ def evaluate_task(task: EvalTask, result: PipelineResult) -> dict[str, float]:
     out = (result.final_output or "").strip()
 
     final_it = result.iterations[-1] if result.iterations else None
-    context = final_it.context if final_it else None
-    critique = final_it.critique if final_it else None
+    best_it = None
+    best_num = int(getattr(result, "best_iteration", 0) or 0)
+    if best_num > 0:
+        best_it = next((it for it in result.iterations if int(it.iteration) == best_num), None)
+    it = best_it or final_it
+    context = it.context if it else None
+    critique = it.critique if it else None
 
     gt = task.ground_truth or {}
     ev = task.evaluation or {}
@@ -123,6 +128,21 @@ def evaluate_task(task: EvalTask, result: PipelineResult) -> dict[str, float]:
     else:
         metrics["context_efficiency"] = 0.0
         metrics["retrieval_precision"] = 0.0
+
+    # Ground-truth-free faithfulness signals (if enabled in pipeline).
+    faith = getattr(it, "faithfulness", None) if it else None
+    if faith is not None:
+        metrics["faithfulness_confidence"] = float(getattr(faith, "confidence", 0.0) or 0.0)
+        metrics["faithfulness_supported_ratio"] = float(
+            getattr(faith, "supported_ratio", 0.0) or 0.0
+        )
+        metrics["faithfulness_should_abstain"] = (
+            1.0 if bool(getattr(faith, "should_abstain", False)) else 0.0
+        )
+    else:
+        metrics["faithfulness_confidence"] = 0.0
+        metrics["faithfulness_supported_ratio"] = 0.0
+        metrics["faithfulness_should_abstain"] = 0.0
 
     metrics["iterations"] = float(len(result.iterations or []))
     metrics["total_latency_ms"] = float(result.total_latency_ms or 0.0)
