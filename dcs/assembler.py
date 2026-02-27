@@ -95,7 +95,9 @@ class ContextAssembler:
     ) -> int:
         """Estimate available retrieval budget inside a fixed context window."""
 
-        return max(0, int(model_config_context_window) - int(system_prompt_tokens) - int(output_reserve))
+        return max(
+            0, int(model_config_context_window) - int(system_prompt_tokens) - int(output_reserve)
+        )
 
     def assemble(self, results: list[YAMSQueryResult], task: str = "") -> ContextBlock:
         budget = int(self.budget)
@@ -141,7 +143,9 @@ class ContextAssembler:
                 else:
                     # Keep the chunk/spec pairing with higher combined base score.
                     prev_chunk, prev_spec = prev
-                    prev_base = _clamp01(float(prev_chunk.score)) * _clamp01(float(prev_spec.importance))
+                    prev_base = _clamp01(float(prev_chunk.score)) * _clamp01(
+                        float(prev_spec.importance)
+                    )
                     new_base = _clamp01(float(ch.score)) * _clamp01(float(spec.importance))
                     if new_base > prev_base:
                         candidates_by_id[cid] = (replace(ch, content=content), spec)
@@ -415,7 +419,9 @@ class ContextAssembler:
                 return tiny
             return None
 
-        truncated = self._truncate_text_to_tokens(chunk.content, allowed_content_tokens, marker=marker)
+        truncated = self._truncate_text_to_tokens(
+            chunk.content, allowed_content_tokens, marker=marker
+        )
         truncated_chunk = replace(chunk, content=truncated)
         truncated_chunk.token_count = self.count_tokens(truncated_chunk.content)
 
@@ -507,7 +513,7 @@ class ContextAssembler:
             return True
         if not self._balanced_delimiters(t):
             return True
-        if t.endswith((",", "\\", "(" , "[", "{", ":")):
+        if t.endswith((",", "\\", "(", "[", "{", ":")):
             return True
         # Very short snippets are often fragments.
         if self.count_tokens(t) < 20 and "\n" not in t and not t.endswith((".", "!", "?")):

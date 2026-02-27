@@ -24,8 +24,8 @@ uv run python benchmarks/retrieval_benchmark.py --task-dir eval/tasks --out resu
 
 ## Current Defaults
 
-- Executor: `openai/gpt-oss-20b`
-- Critic: `qwen3.5-35b-a3b_moe`
+- Executor: `qwen/qwen3-4b-thinking-2507`
+- Critic: `mistralai/ministral-3-14b-reasoning`
 - No-ground-truth mode: enabled
 - DSPy-first faithfulness extractor: enabled (falls back to deterministic parser)
 
@@ -42,3 +42,16 @@ At run start, DCS prints `requested` vs `actual` context window for executor/cri
 - YAMS daemon running (`yams serve` for MCP)
 - LM Studio with models loaded (OpenAI-compatible API at `localhost:1234`)
 - Python 3.11+
+
+## Git hooks (optional)
+
+This submodule includes repo-local hooks to keep diffs clean:
+
+- `pre-commit`: `ruff` lint + auto-fix + format on staged Python files
+- `pre-push`: `pytest` suite
+
+Enable once (run inside `external/agent/`):
+
+```bash
+git config core.hooksPath .githooks
+```

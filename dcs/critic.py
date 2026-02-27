@@ -64,6 +64,7 @@ def _extract_first_json_object(text: str) -> str | None:
     if fence_match:
         try:
             import json as _json
+
             _json.loads(fence_match.group(1))
             return fence_match.group(1)
         except Exception:
@@ -116,6 +117,7 @@ def _extract_first_json_array(text: str) -> str | None:
     if fence_match:
         try:
             import json as _json
+
             _json.loads(fence_match.group(1))
             return fence_match.group(1)
         except Exception:
@@ -262,7 +264,11 @@ class SelfCritic:
         if len(text) <= max_chars:
             return text
         half = max_chars // 2
-        return text[:half] + f"\n\n... [truncated {len(text) - max_chars} chars] ...\n\n" + text[-half:]
+        return (
+            text[:half]
+            + f"\n\n... [truncated {len(text) - max_chars} chars] ...\n\n"
+            + text[-half:]
+        )
 
     def _build_critique_prompt(
         self, task: str, context: ContextBlock, result: ExecutionResult
@@ -286,8 +292,7 @@ class SelfCritic:
         sys = (
             "You are a strict evaluator for a Dynamic Context Scaffold (DCS). "
             "Judge whether the retrieved context helped the model produce a good output. "
-            "Return ONLY the JSON object.\n\n"
-            + schema
+            "Return ONLY the JSON object.\n\n" + schema
         )
 
         sources = context.sources or []
@@ -304,7 +309,10 @@ class SelfCritic:
         response_reserve = 600  # tokens reserved for response
         model_overhead = 200  # tokens for model internal overhead / special tokens
         sys_tokens_est = int(len(sys) / chars_per_token) + 50  # +overhead
-        available_tokens = max(200, int(self.config.context_window) - response_reserve - model_overhead - sys_tokens_est)
+        available_tokens = max(
+            200,
+            int(self.config.context_window) - response_reserve - model_overhead - sys_tokens_est,
+        )
         # Use only 60% of available space to be safe with token estimation errors
         available_chars = int(available_tokens * chars_per_token * 0.6)
 
@@ -313,15 +321,9 @@ class SelfCritic:
         content_budget = int(available_chars * 0.40)
         output_budget = int(available_chars * 0.40)
 
-        ctx_content = self._truncate_for_critic(
-            (context.content or "").strip(), content_budget
-        )
-        model_output = self._truncate_for_critic(
-            (result.output or "").strip(), output_budget
-        )
-        task_text = self._truncate_for_critic(
-            (task or "").strip(), meta_budget
-        )
+        ctx_content = self._truncate_for_critic((context.content or "").strip(), content_budget)
+        model_output = self._truncate_for_critic((result.output or "").strip(), output_budget)
+        task_text = self._truncate_for_critic((task or "").strip(), meta_budget)
 
         user = (
             f"TASK: {task_text}\n\n"
@@ -393,7 +395,9 @@ class SelfCritic:
             reasoning=reasoning.strip(),
         )
 
-    def _heuristic_critique(self, task: str, context: ContextBlock, result: ExecutionResult) -> Critique:
+    def _heuristic_critique(
+        self, task: str, context: ContextBlock, result: ExecutionResult
+    ) -> Critique:
         output = (result.output or "").strip()
         sources = context.sources or []
         chunk_ids = context.chunk_ids or []
@@ -437,7 +441,9 @@ class SelfCritic:
         if not (context.content or "").strip():
             missing.append("No retrieved context was provided (context content is empty).")
         if utilization_est < 0.2 and (context.content or "").strip():
-            missing.append("Relevant citations/anchors (file paths, identifiers) to connect output to context.")
+            missing.append(
+                "Relevant citations/anchors (file paths, identifiers) to connect output to context."
+            )
 
         # Basic query suggestions from the task text.
         task_text = (task or "").strip()

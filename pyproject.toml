@@ -56,7 +56,9 @@ fix = true
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
-ignore = []
+# The formatter is the source of truth for wrapping; don't fail lint on line length.
+# Keep Enum style suggestions informational for now.
+ignore = ["E501", "UP042"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["dcs"]

@@ -216,12 +216,14 @@ class CodemapBuilder:
                 if display.startswith("file:"):
                     display = display[5:]
 
-                nodes.append(GraphNode(
-                    node_key=node_key,
-                    node_type=node_type,
-                    label=label or display,
-                    properties=props if isinstance(props, dict) else {},
-                ))
+                nodes.append(
+                    GraphNode(
+                        node_key=node_key,
+                        node_type=node_type,
+                        label=label or display,
+                        properties=props if isinstance(props, dict) else {},
+                    )
+                )
         except Exception as e:
             logger.warning("codemap: list file nodes failed: %s", e)
 
@@ -242,11 +244,13 @@ class CodemapBuilder:
                 if not source or source in seen_sources:
                     continue
                 seen_sources.add(source)
-                nodes.append(GraphNode(
-                    node_key=f"file:{source}",
-                    node_type="file",
-                    label=source,
-                ))
+                nodes.append(
+                    GraphNode(
+                        node_key=f"file:{source}",
+                        node_type="file",
+                        label=source,
+                    )
+                )
             return nodes
         except Exception as e:
             logger.warning("codemap: search fallback failed: %s", e)
@@ -287,9 +291,7 @@ class CodemapBuilder:
 
         return None
 
-    async def _get_file_symbols(
-        self, file_node: GraphNode
-    ) -> tuple[list[GraphNode], int]:
+    async def _get_file_symbols(self, file_node: GraphNode) -> tuple[list[GraphNode], int]:
         """Get symbols (functions, classes) contained in a file."""
         try:
             self._query_count += 1
@@ -316,9 +318,20 @@ class CodemapBuilder:
                     props = {}
 
                 # Filter to code symbols
-                if node_type not in ("function", "class", "method", "struct",
-                                     "enum", "interface", "trait", "namespace",
-                                     "variable", "constant", "typedef", "macro"):
+                if node_type not in (
+                    "function",
+                    "class",
+                    "method",
+                    "struct",
+                    "enum",
+                    "interface",
+                    "trait",
+                    "namespace",
+                    "variable",
+                    "constant",
+                    "typedef",
+                    "macro",
+                ):
                     continue
 
                 # Extract short name from node_key
@@ -329,19 +342,31 @@ class CodemapBuilder:
                     parts = short.split("::")
                     display = parts[-1] if parts else display
 
-                symbols.append(GraphNode(
-                    node_key=node_key,
-                    node_type=node_type,
-                    label=display,
-                    properties=props if isinstance(props, dict) else {},
-                    depth=1,
-                ))
+                symbols.append(
+                    GraphNode(
+                        node_key=node_key,
+                        node_type=node_type,
+                        label=display,
+                        properties=props if isinstance(props, dict) else {},
+                        depth=1,
+                    )
+                )
 
             # Sort: classes first, then functions, then others
-            type_order = {"class": 0, "struct": 0, "interface": 0, "trait": 0,
-                          "enum": 1, "namespace": 1,
-                          "function": 2, "method": 2,
-                          "variable": 3, "constant": 3, "typedef": 3, "macro": 3}
+            type_order = {
+                "class": 0,
+                "struct": 0,
+                "interface": 0,
+                "trait": 0,
+                "enum": 1,
+                "namespace": 1,
+                "function": 2,
+                "method": 2,
+                "variable": 3,
+                "constant": 3,
+                "typedef": 3,
+                "macro": 3,
+            }
             symbols.sort(key=lambda s: (type_order.get(s.node_type, 9), s.label))
 
             return symbols, edge_count
