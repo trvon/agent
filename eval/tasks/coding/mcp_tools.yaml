@@ -1,0 +1,47 @@
+id: coding-mcp-tools
+task_type: coding
+description: >
+  What MCP tools does the YAMS server expose? List each tool name
+  and a one-line description of what it does. Focus on the tool names
+  registered in mcp_server.cpp.
+ground_truth:
+  files:
+    - src/mcp/mcp_server.cpp
+    - include/yams/mcp/tool_registry.h
+  symbols:
+    - registerTool
+    - registerRawTool
+    - search
+    - grep
+    - add
+    - get
+    - graph
+    - session_start
+    - update_metadata
+  patterns:
+    - search
+    - grep
+    - store
+    - get
+    - graph
+    - download
+    - delete
+    - update_metadata
+    - session_start
+    - restore
+evaluation:
+  contains_patterns:
+    - search
+    - grep
+    - store
+    - get
+    - graph
+  pass_metric: contains_pattern
+  pass_threshold: 0.8
+  length:
+    min_tokens: 30
+    max_tokens: 800
+tags:
+  - mcp
+  - tool-registry
+  - architecture

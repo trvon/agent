@@ -1,0 +1,140 @@
+# Model configurations for DCS experiments
+# Primary: LM Studio (OpenAI-compatible API at localhost:1234)
+# Secondary: Ollama (OpenAI-compatible API at localhost:11434) for OSS release
+
+backends:
+  lmstudio:
+    base_url: "http://localhost:1234/v1"
+    api_key: "lm-studio"
+
+  ollama:
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+
+# Models available for experiments (update based on what's loaded)
+models:
+  # --- Small models (primary scaffolding targets) ---
+  nemotron-nano:
+    backend: lmstudio
+    name: "nvidia/nemotron-3-nano"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: executor
+
+  qwen3-4b:
+    backend: lmstudio
+    name: "qwen/qwen3-4b-thinking-2507"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: executor
+
+  ministral-3-14b-reasoning:
+    backend: lmstudio
+    name: "mistralai/ministral-3-14b-reasoning"
+    context_window: 32768
+    max_output_tokens: 4096
+    temperature: 0.7
+    role: critic
+    request_timeout_s: 240
+    max_retries: 3
+    retry_backoff_s: 3.0
+
+  # --- Mid-tier models (comparison + critic) ---
+  qwen3-30b-a3b:
+    backend: lmstudio
+    name: "qwen/qwen3-30b-a3b-2507"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: critic
+
+  qwen35-35b-a3b:
+    backend: lmstudio
+    name: "qwen3.5-35b-a3b_moe"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: critic
+    request_timeout_s: 300
+    max_retries: 3
+    retry_backoff_s: 3.0
+
+  qwen35-35b-a3b-mlx:
+    backend: lmstudio
+    name: "mlx-community/qwen3.5-35b-a3b"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: critic
+    request_timeout_s: 300
+    max_retries: 3
+    retry_backoff_s: 3.0
+
+  qwen35-35b-a3b-unsloth-executor:
+    backend: lmstudio
+    name: "unsloth/qwen3.5-35b-a3b"
+    context_window: 262144
+    max_output_tokens: 4096
+    temperature: 0.7
+    role: executor
+    request_timeout_s: 300
+    max_retries: 3
+    retry_backoff_s: 3.0
+
+  qwen35-35b-a3b-unsloth-critic:
+    backend: lmstudio
+    name: "unsloth/qwen3.5-35b-a3b"
+    context_window: 262144
+    max_output_tokens: 4096
+    temperature: 0.7
+    role: critic
+    request_timeout_s: 300
+    max_retries: 3
+    retry_backoff_s: 3.0
+
+  devstral:
+    backend: lmstudio
+    name: "mistralai/devstral-small-2-2512"
+    context_window: 32768
+    max_output_tokens: 4096
+    temperature: 0.7
+    role: critic
+
+  gemma-27b:
+    backend: lmstudio
+    name: "google/gemma-3-27b"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: critic
+    request_timeout_s: 240
+    max_retries: 2
+    retry_backoff_s: 2.0
+
+  gpt-oss-20b:
+    backend: lmstudio
+    name: "openai/gpt-oss-20b"
+    context_window: 8192
+    max_output_tokens: 2048
+    temperature: 0.7
+    role: executor
+    request_timeout_s: 180
+    max_retries: 2
+    retry_backoff_s: 2.0
+
+  # --- Large models (ceiling reference) ---
+  gpt-oss-120b:
+    backend: lmstudio
+    name: "openai/gpt-oss-120b"
+    context_window: 32768
+    max_output_tokens: 4096
+    temperature: 0.7
+    role: baseline
+
+# Default experiment configuration
+defaults:
+  executor: qwen35-35b-a3b-unsloth-executor
+  critic: qwen35-35b-a3b-unsloth-critic
+  baseline: qwen35-35b-a3b-unsloth-critic

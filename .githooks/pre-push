@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Repo-local pre-push hook for the DCS agent harness.
+# Runs the full test suite before pushing.
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+uv run pytest -q
+
+exit 0
